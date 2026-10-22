@@ -3,9 +3,11 @@
 //! The library owns the output returned by `get()`. This wrapper copies it
 //! before any later mutating call so ordinary small Rust reads cannot lose it.
 
+use std::cell::Cell;
 use std::ffi::CString;
 use std::io::{self, ErrorKind, Read, Write};
 use std::ptr::NonNull;
+use std::time::{Duration, Instant};
 
 use log::warn;
 
@@ -44,6 +46,7 @@ pub struct StreamDecoder {
     ctx: NonNull<AribStdB61>,
     pending: Vec<u8>,
     pending_offset: usize,
+    last_encrypted_warning: Cell<Option<Instant>>,
 }
 
 impl StreamDecoder {
@@ -55,6 +58,7 @@ impl StreamDecoder {
             ctx,
             pending: Vec::new(),
             pending_offset: 0,
+            last_encrypted_warning: Cell::new(None),
         };
         if let Err(error) = decoder.configure(options) {
             unsafe { arib_std_b61_release(decoder.ctx.as_ptr()) };
@@ -80,6 +84,7 @@ impl StreamDecoder {
     pub fn reset(&mut self) -> io::Result<()> {
         self.pending.clear();
         self.pending_offset = 0;
+        self.last_encrypted_warning.set(None);
         self.result(unsafe { arib_std_b61_reset(self.ctx.as_ptr()) })
     }
 
@@ -87,7 +92,13 @@ impl StreamDecoder {
         match code {
             0 => Ok(()),
             1 => {
-                warn!("libaribb61 accepted input but left one or more packets encrypted");
+                let now = Instant::now();
+                if self.last_encrypted_warning.get().map_or(true, |last| {
+                    now.duration_since(last) >= Duration::from_secs(30)
+                }) {
+                    warn!("libaribb61 accepted input but left one or more packets encrypted");
+                    self.last_encrypted_warning.set(Some(now));
+                }
                 Ok(())
             }
             -1 => Err(io::Error::new(
