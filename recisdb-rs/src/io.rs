@@ -12,14 +12,56 @@ use futures_util::{AsyncBufRead, AsyncWrite};
 use log::{error, info, warn};
 use pin_project_lite::pin_project;
 
-use b25_sys::{DecoderOptions, StreamDecoder};
+use b25_sys::{DecoderOptions as B25DecoderOptions, StreamDecoder as B25StreamDecoder};
+#[cfg(feature = "b61")]
+use b61_sys::{DecoderOptions as B61DecoderOptions, StreamDecoder as B61StreamDecoder};
+
+pub(crate) enum DecoderConfig {
+    B25(B25DecoderOptions),
+    #[cfg(feature = "b61")]
+    B61(B61DecoderOptions),
+}
+
+enum DecoderBackend {
+    B25(B25StreamDecoder),
+    #[cfg(feature = "b61")]
+    B61(B61StreamDecoder),
+}
+
+impl std::io::Read for DecoderBackend {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::B25(decoder) => std::io::Read::read(decoder, buf),
+            #[cfg(feature = "b61")]
+            Self::B61(decoder) => std::io::Read::read(decoder, buf),
+        }
+    }
+}
+
+impl std::io::Write for DecoderBackend {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::B25(decoder) => std::io::Write::write(decoder, buf),
+            #[cfg(feature = "b61")]
+            Self::B61(decoder) => std::io::Write::write(decoder, buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::B25(decoder) => std::io::Write::flush(decoder),
+            #[cfg(feature = "b61")]
+            Self::B61(decoder) => std::io::Write::flush(decoder),
+        }
+    }
+}
 
 pin_project! {
     pub(crate) struct AsyncInOutTriple {
         #[pin]
         i: Box<dyn AsyncBufRead + Unpin + 'static>,
         o: AllowStdIo<Box<dyn Write>>,
-        dec: RefCell<Option<BufReader<AllowStdIo<StreamDecoder>>>>,
+        dec: RefCell<Option<BufReader<AllowStdIo<DecoderBackend>>>>,
         amt: u64,
         abandon_decoder: Option<bool>,
         abort: Arc<AtomicBool>,
@@ -32,10 +74,10 @@ impl AsyncInOutTriple {
     pub fn new(
         i: Box<dyn AsyncBufRead + Unpin>,
         o: Box<dyn Write>,
-        config: Option<DecoderOptions>,
+        config: Option<DecoderConfig>,
         continue_on_error: bool,
     ) -> (Self, std::sync::mpsc::Receiver<u64>) {
-        let raw = config.and_then(|op| match StreamDecoder::new(op) {
+        let raw = config.and_then(|op| match DecoderBackend::new(op) {
             Ok(raw) => Some(raw),
             Err(e) if continue_on_error => {
                 error!("Failed to initialize the decoder. ({})", e);
@@ -45,7 +87,7 @@ impl AsyncInOutTriple {
             }
             Err(e) => {
                 error!("Error occurred while initializing the decoder. ({})", e);
-                error!("Make sure that the B-CAS card is certainly connected.");
+                error!("Check the CAS reader or proxy connection.");
                 std::process::exit(-1)
             }
         });
@@ -82,6 +124,16 @@ impl AsyncInOutTriple {
             },
             progress_rx,
         )
+    }
+}
+
+impl DecoderBackend {
+    fn new(config: DecoderConfig) -> io::Result<Self> {
+        match config {
+            DecoderConfig::B25(options) => B25StreamDecoder::new(options).map(Self::B25),
+            #[cfg(feature = "b61")]
+            DecoderConfig::B61(options) => B61StreamDecoder::new(options).map(Self::B61),
+        }
     }
 }
 

@@ -1,0 +1,16 @@
+[package]
+name = "b61-sys"
+version = "0.1.0"
+edition = "2021"
+description = "Safe streaming wrapper for libaribb61."
+license = "GPL-3.0-or-later"
+repository = "https://github.com/kazuki0824/recisdb-rs.git"
+keywords = ["dtv", "japan", "broadcast", "b61", "isdb-s3"]
+build = "build.rs"
+
+[dependencies]
+log = "^0.4.17"
+
+[build-dependencies]
+pkg-config = "0.3.25"
+cmake = "0.1"

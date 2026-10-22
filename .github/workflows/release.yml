@@ -237,7 +237,7 @@ jobs:
       - name: Build
         run: |
           $env:RUSTFLAGS="-C target-feature=+crt-static"
-          cargo build --workspace --verbose --release --target ${{ matrix.arch }}
+          cargo build --workspace --exclude b61-sys --verbose --release --target ${{ matrix.arch }}
           Rename-Item -Path ./target/${{ matrix.arch }}/release/recisdb.exe recisdb-${{ matrix.arch }}.exe
       - name: Upload exe artifact
         uses: actions/upload-artifact@v4
@@ -264,7 +264,7 @@ jobs:
           targets: aarch64-apple-darwin
       - name: Build
         run: |
-          cargo build --workspace --verbose --release --target aarch64-apple-darwin
+          cargo build --workspace --exclude b61-sys --verbose --release --target aarch64-apple-darwin
           cp ./target/aarch64-apple-darwin/release/recisdb ./recisdb-aarch64-apple-darwin
       - name: Verify system PCSC linkage
         run: |

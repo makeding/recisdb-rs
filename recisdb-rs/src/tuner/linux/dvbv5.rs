@@ -1,12 +1,10 @@
-mod table;
-
 use crate::channels::output::DvbFreq;
 use crate::channels::{Channel, ChannelType};
 use crate::tuner::Voltage;
 use dvbv5::{DmxFd, FrontendId, FrontendParametersPtr};
 use dvbv5_sys::fe_delivery_system::{SYS_ISDBS, SYS_ISDBT};
 use dvbv5_sys::fe_sec_voltage::{SEC_VOLTAGE_13, SEC_VOLTAGE_18};
-use dvbv5_sys::fe_status::{self, FE_HAS_LOCK};
+use dvbv5_sys::fe_status::FE_HAS_LOCK;
 use dvbv5_sys::{
     dmx_output, dmx_ts_pes, dvb_set_compat_delivery_system, DTV_BANDWIDTH_HZ, DTV_FREQUENCY,
     DTV_ISDBT_LAYER_ENABLED, DTV_ISDBT_PARTIAL_RECEPTION, DTV_ISDBT_SOUND_BROADCASTING, DTV_STATUS,
@@ -14,7 +12,7 @@ use dvbv5_sys::{
 };
 use futures_util::io::{AllowStdIo, BufReader};
 use futures_util::{AsyncBufRead, AsyncRead};
-use log::{error, info, warn};
+use log::{error, info};
 use std::ffi::c_uint;
 use std::fs::File;
 use std::io::Error;
@@ -71,118 +69,82 @@ impl UnTunedTuner {
     pub fn tune(self, ch: Channel, lnb: Option<Voltage>) -> Result<Tuner, Error> {
         const WAIT_DUR: std::time::Duration = std::time::Duration::from_secs(1);
 
-        // fe
-        let _result = unsafe {
+        let raw_freq = DvbFreq::try_from(ch.ch_type.clone())?;
+        unsafe {
             let p = self.frontend.get_c_ptr();
-
-            let raw_freq: DvbFreq = ch.ch_type.clone().into();
-
-            match &ch.ch_type {
-                ChannelType::Terrestrial(..) | ChannelType::Catv(..) => {
-                    dvb_set_compat_delivery_system(p, SYS_ISDBT as u32);
-                    dvbv5_sys::dvb_fe_store_parm(p, DTV_FREQUENCY as c_uint, raw_freq.freq_hz);
-                    dvbv5_sys::dvb_fe_store_parm(p, DTV_BANDWIDTH_HZ as c_uint, 6000000);
-
-                    dvbv5_sys::dvb_fe_store_parm(p, DTV_ISDBT_PARTIAL_RECEPTION, 0);
-                    dvbv5_sys::dvb_fe_store_parm(p, DTV_ISDBT_SOUND_BROADCASTING, 0);
-                    dvbv5_sys::dvb_fe_store_parm(p, DTV_ISDBT_LAYER_ENABLED, 0x07);
-
-                    dvbv5_sys::dvb_fe_set_parms(p)
-                }
-                ChannelType::BS(_, filter) | ChannelType::CS(_, filter) => {
-                    dvb_set_compat_delivery_system(p, SYS_ISDBS as u32);
-                    dvbv5_sys::dvb_fe_store_parm(p, DTV_FREQUENCY as c_uint, raw_freq.freq_hz);
-                    let id = match raw_freq.stream_id {
-                        Some(id) if id < 12 => {
-                            // unsafe {
-                            //     dvbv5_sys::dvb_fe_store_parm(p, DTV_STREAM_ID as c_uint, 0);
-                            //     dvbv5_sys::dvb_set_pesfilter(
-                            //         self.demux.as_raw_fd(),
-                            //         0x0010,
-                            //         dmx_ts_pes::DMX_PES_OTHER,
-                            //         dmx_output::DMX_OUT_TS_TAP,
-                            //         8192,
-                            //     );
-                            //     dvbv5_sys::dvb_set_section_filter(
-                            //         self.demux.as_raw_fd(),
-                            //         0x2000,
-                            //         18,
-                            //         null_mut() as *mut _,
-                            //         null_mut() as *mut _,
-                            //         null_mut() as *mut _,
-                            //         DMX_IMMEDIATE_START, // | DMX_CHECK_CRC
-                            //     );
-                            //     dvbv5_sys::dvb_fe_set_parms(p);
-                            // }
-                            // dvbv5_sys::dvb_dmx_stop(self.demux.as_raw_fd());
-
-                            let (s, _) = table::get_tsid_tables();
-                            match table::seek(s, ch.get_raw_ch_name()) {
-                                Some(id) => {
-                                    info!(
-                                        "{:?} -> AbsTsId({}) using the hardcoded table",
-                                        filter, id
-                                    );
-                                    id
-                                }
-                                None => {
-                                    warn!("Failed to get TSID. Consider using '--tsid'.");
-                                    NO_STREAM_ID_FILTER as u32
-                                }
-                            }
-                        }
-
-                        Some(id) => id,
-                        _ => NO_STREAM_ID_FILTER as u32,
-                    };
-                    dvbv5_sys::dvb_fe_store_parm(p, DTV_STREAM_ID as c_uint, id);
-                    match lnb {
-                        Some(Voltage::_11v) => {
-                            dvbv5_sys::dvb_fe_store_parm(p, DTV_VOLTAGE, SEC_VOLTAGE_13 as u32)
-                        }
-                        Some(Voltage::_15v) => {
-                            dvbv5_sys::dvb_fe_store_parm(p, DTV_VOLTAGE, SEC_VOLTAGE_18 as u32)
-                        }
-                        _ => 0,
-                    };
-
-                    dvbv5_sys::dvb_fe_set_parms(p)
-                }
+            let system = match ch.ch_type {
+                ChannelType::Terrestrial(..) | ChannelType::Catv(..) => SYS_ISDBT,
+                ChannelType::BS(..) | ChannelType::CS(..) => SYS_ISDBS,
                 _ => {
-                    error!("The specified channel is invalid.");
-                    std::process::exit(1);
+                    return Err(Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Unsupported DVB channel",
+                    ))
                 }
             };
-
-            let mut stat: fe_status = fe_status::FE_NONE;
-            let (mut _res, mut counter) = (0, 0);
-            while (stat as u8 & FE_HAS_LOCK as u8) == 0 {
-                std::thread::sleep(WAIT_DUR);
-                _res = dvbv5_sys::dvb_fe_get_stats(p);
-                _res = dvbv5_sys::dvb_fe_retrieve_stats(
-                    p,
-                    DTV_STATUS as c_uint,
-                    &mut stat as *mut fe_status as *mut _,
-                );
-                info!("Checking for the frontend lock...");
-
-                if counter > 5 {
-                    error!("No signal.");
-                    std::process::exit(-1)
-                } else {
-                    counter += 1;
+            // S3-capable drivers use the same SYS_ISDBS ABI as recdvb.
+            check_dvb_result(
+                "select delivery system",
+                dvb_set_compat_delivery_system(p, system as u32),
+            )?;
+            let store = |key, value| {
+                check_dvb_result(
+                    &format!("set DVB property {key}"),
+                    dvbv5_sys::dvb_fe_store_parm(p, key, value),
+                )
+            };
+            store(DTV_FREQUENCY as c_uint, raw_freq.freq_hz)?;
+            match ch.ch_type {
+                ChannelType::Terrestrial(..) | ChannelType::Catv(..) => {
+                    store(DTV_BANDWIDTH_HZ as c_uint, 6_000_000)?;
+                    store(DTV_ISDBT_PARTIAL_RECEPTION, 0)?;
+                    store(DTV_ISDBT_SOUND_BROADCASTING, 0)?;
+                    store(DTV_ISDBT_LAYER_ENABLED, 0x07)?;
+                }
+                _ => {
+                    store(
+                        DTV_STREAM_ID as c_uint,
+                        raw_freq.stream_id.unwrap_or(NO_STREAM_ID_FILTER as u32),
+                    )?;
+                    match lnb {
+                        Some(Voltage::_11v) => store(DTV_VOLTAGE, SEC_VOLTAGE_13 as u32)?,
+                        Some(Voltage::_15v) => store(DTV_VOLTAGE, SEC_VOLTAGE_18 as u32)?,
+                        _ => {}
+                    }
                 }
             }
-        };
-        // dmx
-        unsafe {
-            dvbv5_sys::dvb_set_pesfilter(
-                self.demux.as_raw_fd(),
-                0x2000,
-                dmx_ts_pes::DMX_PES_OTHER,
-                dmx_output::DMX_OUT_TS_TAP,
-                8192,
-            );
+            check_dvb_result("tune frontend", dvbv5_sys::dvb_fe_set_parms(p))?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(7);
+            loop {
+                check_dvb_result("read frontend statistics", dvbv5_sys::dvb_fe_get_stats(p))?;
+                // Status is a bitmask, not necessarily a named C enum value.
+                let mut status = 0u32;
+                check_dvb_result(
+                    "read frontend lock",
+                    dvbv5_sys::dvb_fe_retrieve_stats(p, DTV_STATUS as c_uint, &mut status),
+                )?;
+                if status & FE_HAS_LOCK as u32 != 0 {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "No frontend lock after 7 seconds",
+                    ));
+                }
+                info!("Checking for the frontend lock...");
+                std::thread::sleep(WAIT_DUR);
+            }
+            check_dvb_result(
+                "start DVB demux",
+                dvbv5_sys::dvb_set_pesfilter(
+                    self.demux.as_raw_fd(),
+                    0x2000,
+                    dmx_ts_pes::DMX_PES_OTHER,
+                    dmx_output::DMX_OUT_TS_TAP,
+                    1024 * 1024,
+                ),
+            )?;
         }
 
         // Wrap the DVR device file in ThreadedReader so that a dedicated
@@ -247,5 +209,16 @@ impl AsyncBufRead for Tuner {
 
     fn consume(self: Pin<&mut Self>, amt: usize) {
         Pin::new(&mut self.get_mut().stream).consume(amt)
+    }
+}
+
+fn check_dvb_result(operation: &str, result: i32) -> Result<(), Error> {
+    if result < 0 {
+        Err(Error::new(
+            std::io::ErrorKind::Other,
+            format!("Failed to {operation} (libdvbv5 returned {result})"),
+        ))
+    } else {
+        Ok(())
     }
 }

@@ -6,23 +6,26 @@ use std::io::Write;
 #[cfg(any(
     target_os = "linux",
     target_os = "windows",
-    not(feature = "prioritized_card_reader")
+    not(feature = "prioritized_card_reader"),
+    feature = "b61"
 ))]
 use log::warn;
 use log::{error, info};
 
 use b25_sys::DecoderOptions;
+#[cfg(feature = "b61")]
+use b61_sys::DecoderOptions as B61DecoderOptions;
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-use crate::channels::representation::TsFilter;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::channels::{Channel, ChannelType};
 use crate::commands::utils::parse_keys;
 use crate::context::{Cli, Commands};
-use crate::io::AsyncInOutTriple;
+use crate::io::{AsyncInOutTriple, DecoderConfig};
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::tuner::{Tunable, UnTunedTuner};
 
+#[cfg(any(test, target_os = "linux", target_os = "windows"))]
+mod selection;
 pub(crate) mod utils;
 
 /// The behavior the user requested are returned.
@@ -51,9 +54,6 @@ pub(crate) fn process_command(
         } => {
             // Get channel
             let channel = channel.map(|ch| Channel::new(ch, None)).unwrap();
-            if let ChannelType::BS(_, TsFilter::RelTsNum(num)) = channel.ch_type {
-                warn!("The specified relative TS num '_{}' has no effect.", num)
-            }
             if let ChannelType::Undefined = channel.ch_type {
                 error!("The specified channel is invalid.");
                 std::process::exit(1);
@@ -96,23 +96,33 @@ pub(crate) fn process_command(
             key1,
             no_simd,
             no_strip,
+            b61,
+            cas_proxy,
             output,
             exit_on_card_error,
         } => {
-            // Card reader
-            if let Some(name) = card {
-                #[cfg(not(feature = "prioritized_card_reader"))]
-                warn!("--card {name} has no effect. Use `prioritized_card_reader` feature flag.");
-
-                #[cfg(feature = "prioritized_card_reader")]
-                b25_sys::set_card_reader_name(&name);
-            }
-
-            // Get channel
             let channel = channel.map(|ch| Channel::new(ch, tsid)).unwrap();
             if let ChannelType::Undefined = channel.ch_type {
                 error!("The specified channel is invalid.");
                 std::process::exit(1);
+            }
+            let use_b61 = selection::select_b61(
+                channel.stream_format(),
+                disable_decode,
+                b61,
+                cfg!(feature = "b61"),
+                card.is_some() || key0.is_some() || key1.is_some() || no_simd,
+                cas_proxy.is_some(),
+            )
+            .unwrap_or_else(|message| {
+                error!("{message}");
+                std::process::exit(1)
+            });
+            if let Some(name) = card {
+                #[cfg(not(feature = "prioritized_card_reader"))]
+                warn!("--card {name} has no effect. Use `prioritized_card_reader` feature flag.");
+                #[cfg(feature = "prioritized_card_reader")]
+                b25_sys::set_card_reader_name(&name);
             }
             info!("Tuner: {}", device.clone().unwrap());
             info!(
@@ -150,12 +160,28 @@ pub(crate) fn process_command(
                 None
             } else {
                 info!("Decode: Enabled");
-                Some(DecoderOptions {
-                    enable_working_key: parse_keys(key0, key1),
-                    simd: !no_simd,
-                    strip: !no_strip,
-                    ..DecoderOptions::default()
-                })
+                if use_b61 {
+                    #[cfg(feature = "b61")]
+                    {
+                        Some(DecoderConfig::B61(B61DecoderOptions {
+                            strip: !no_strip,
+                            cas_proxy,
+                            ..B61DecoderOptions::default()
+                        }))
+                    }
+                    #[cfg(not(feature = "b61"))]
+                    {
+                        error!("B61 decoding requires building recisdb with the `b61` feature");
+                        std::process::exit(1)
+                    }
+                } else {
+                    Some(DecoderConfig::B25(DecoderOptions {
+                        enable_working_key: parse_keys(key0, key1),
+                        simd: !no_simd,
+                        strip: !no_strip,
+                        ..DecoderOptions::default()
+                    }))
+                }
             };
 
             let (body, _) = AsyncInOutTriple::new(input, output, dec, !exit_on_card_error);
@@ -169,8 +195,16 @@ pub(crate) fn process_command(
             key1,
             no_simd,
             no_strip,
+            b61,
+            cas_proxy,
             output,
         } => {
+            #[cfg(not(feature = "b61"))]
+            if b61 {
+                error!("B61 decoding requires building recisdb with the `b61` feature");
+                std::process::exit(1)
+            }
+
             // Card reader
             if let Some(name) = card {
                 #[cfg(not(feature = "prioritized_card_reader"))]
@@ -193,12 +227,31 @@ pub(crate) fn process_command(
                     std::process::exit(1);
                 })
                 .unwrap();
-            let dec = Some(DecoderOptions {
-                enable_working_key: parse_keys(key0, key1),
-                simd: !no_simd,
-                strip: !no_strip,
-                ..DecoderOptions::default()
-            });
+            let dec = if b61 {
+                #[cfg(feature = "b61")]
+                {
+                    if key0.is_some() || key1.is_some() || no_simd {
+                        warn!("--key0/--key1 and --no-simd do not apply to B61 decoding");
+                    }
+                    Some(DecoderConfig::B61(B61DecoderOptions {
+                        strip: !no_strip,
+                        cas_proxy,
+                        ..B61DecoderOptions::default()
+                    }))
+                }
+                #[cfg(not(feature = "b61"))]
+                {
+                    error!("B61 decoding requires building recisdb with the `b61` feature");
+                    std::process::exit(1)
+                }
+            } else {
+                Some(DecoderConfig::B25(DecoderOptions {
+                    enable_working_key: parse_keys(key0, key1),
+                    simd: !no_simd,
+                    strip: !no_strip,
+                    ..DecoderOptions::default()
+                }))
+            };
 
             let (body, progress) = AsyncInOutTriple::new(input, output, dec, false);
             info!("Decoding...");

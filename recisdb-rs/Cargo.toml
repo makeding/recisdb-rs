@@ -19,10 +19,12 @@ bg-runtime = ["bindgen/runtime"]
 crypto = [ "b25-sys/block00cbc", "b25-sys/block40cbc" ]
 dvb = [ "dvbv5", "dvbv5-sys" ]
 prioritized_card_reader = [ "b25-sys/prioritized_card_reader" ]
+b61 = ["b61-sys"]
 default = [ "bg-runtime", "prioritized_card_reader" ]
 
 [dependencies]
 b25-sys = { path = "../b25-sys" }
+b61-sys = { path = "../b61-sys", optional = true }
 chrono = "^0.4.26"
 clap = { version = "^4.4", features = ["derive"] }
 clap-num = "1"

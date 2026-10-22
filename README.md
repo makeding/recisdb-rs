@@ -87,6 +87,31 @@ recisdb decode [OPTIONS] --input <file> <OUTPUT>
 
 詳しいオプションは `recisdb --help` / `recisdb <SUBCOMMAND> --help` を参照してください。
 
+### ISDB-S3 / ARIB STD-B61 (experimental)
+
+`b61` Cargo feature enables `--b61` on `tune` and `decode`. It uses the
+pinned `b61-sys/externals/libaribb61` submodule, built by Cargo with CMake
+and statically linked. Linux can use an installed library through `pkg-config`,
+falling back to the submodule. Bundled builds need standalone Asio headers
+and the platform PC/SC development library. `--cas-proxy
+<ADDRESS>` selects the ACAS proxy before input is read.
+
+```bash
+git submodule update --init --recursive
+cargo build -p recisdb --features b61
+recisdb decode --b61 --cas-proxy 127.0.0.1:40772 -i input.tlv output.tlv
+```
+
+With the `dvb` feature, Linux DVB tuning accepts ISDB-S3 physical channels
+(BS7/11/17, even BS and odd CS) and selects B61 automatically for TLV.
+Build with `--features dvb,b61` for decoded recordings. `--no-decode` records
+raw bytes without requiring B61; `--b61` remains an explicit decoder override.
+Legacy character-device ioctls reject S3 channels. Output stays TLV/MMT,
+without conversion to MPEG-TS. See [4K support and validation](docs/4k-support.md).
+The initial B61 backend handles libaribb61's compressed-IP/AES scope and can
+leave packets encrypted when keys are unavailable. Successful file I/O is not
+proof that every packet was descrambled.
+
 ### Channel
 
 `-c` または `--channel` でのチャンネル指定フォーマットは下記の通りです。  

@@ -3,6 +3,10 @@ if(NOT APPLE)
     return()
 endif()
 
+# Mach-O has no ELF interpreter. Prevent the upstream optional readelf probe
+# from running merely because a GNU readelf happens to be installed.
+set(READELF_EXECUTABLE "" CACHE FILEPATH "Not applicable to Mach-O" FORCE)
+
 # CMake normally supplies the SDK to the compiler, but resolve it explicitly
 # before FindPCSC runs so that both headers and the framework come from the
 # same SDK.  Accept either an explicit SDK path or an xcrun SDK name.

@@ -145,6 +145,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "b61-sys"
+version = "0.1.0"
+dependencies = [
+ "cmake",
+ "log",
+ "pkg-config",
+]
+
+[[package]]
 name = "bindgen"
 version = "0.71.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -976,9 +985,10 @@ checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
 name = "recisdb"
-version = "1.2.4"
+version = "1.3.0"
 dependencies = [
  "b25-sys",
+ "b61-sys",
  "bindgen",
  "cc",
  "chrono",

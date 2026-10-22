@@ -2,20 +2,33 @@ use crate::channels::representation::TsFilter::{AbsTsId, AsIs, RelTsNum};
 pub(crate) use crate::channels::representation::{ChannelSpace, ChannelType};
 use log::{error, warn};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamFormat {
+    Ts,
+    Tlv,
+}
+
 pub mod output {
     use crate::channels::representation::{ChannelType, TsFilter};
-    use log::error;
+    use crate::channels::StreamFormat;
+    use std::io::{self, ErrorKind};
 
     #[repr(C)]
     #[allow(dead_code)]
+    #[derive(Debug)]
     pub struct IoctlFreq {
         pub ch: i32,
         pub slot: i32,
     }
 
-    impl From<ChannelType> for IoctlFreq {
-        fn from(value: ChannelType) -> Self {
+    impl TryFrom<ChannelType> for IoctlFreq {
+        type Error = io::Error;
+
+        fn try_from(value: ChannelType) -> Result<Self, Self::Error> {
             const OFFSET_HZ: i32 = 0;
+            if value.stream_format() == StreamFormat::Tlv {
+                return s3_ioctl_error();
+            }
 
             let ioctl_channel = match &value {
                 ChannelType::Terrestrial(ch_num, ..) if (13..=62).contains(ch_num) => ch_num + 50,
@@ -27,76 +40,94 @@ pub mod output {
                 ChannelType::BS(ch_num, _) if (1..=23).contains(ch_num) && (ch_num % 2 == 1) => {
                     ch_num / 2
                 }
-
-                ChannelType::BonCh(_) | ChannelType::BonChSpace(_) => {
-                    error!("{:?} is not supported in Linux.", value);
-                    std::process::exit(-1)
-                }
-                _ => unreachable!("Invalid channel."),
+                ChannelType::BS(..) | ChannelType::CS(..) => return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "ISDB-S3 channels require a DVB frontend; they are unsupported by the character-device ioctl",
+                )),
+                _ => return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("{value:?} is not supported by the character-device ioctl"),
+                )),
             };
             let slot = match value {
-                ChannelType::CS(_, TsFilter::AbsTsId(stream_id)) => stream_id as i32,
+                ChannelType::CS(_, TsFilter::AbsTsId(stream_id)) => i32::try_from(stream_id)
+                    .map_err(|_| {
+                        io::Error::new(ErrorKind::InvalidInput, "TSID exceeds ioctl range")
+                    })?,
                 ChannelType::CS(..) => 0,
                 ChannelType::BS(_, TsFilter::AsIs) => -1,
-                ChannelType::BS(_, TsFilter::AbsTsId(stream_id)) => stream_id as i32,
+                ChannelType::BS(_, TsFilter::AbsTsId(stream_id)) => i32::try_from(stream_id)
+                    .map_err(|_| {
+                        io::Error::new(ErrorKind::InvalidInput, "TSID exceeds ioctl range")
+                    })?,
                 ChannelType::BS(_, TsFilter::RelTsNum(num)) => num,
 
                 _ => OFFSET_HZ,
             };
 
-            Self {
+            Ok(Self {
                 ch: ioctl_channel as i32,
                 slot,
-            }
+            })
         }
     }
 
+    fn s3_ioctl_error() -> io::Result<IoctlFreq> {
+        Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "ISDB-S3 channels require a DVB frontend; they are unsupported by the character-device ioctl",
+        ))
+    }
+
+    #[derive(Debug)]
     pub struct DvbFreq {
         pub freq_hz: u32,
         pub stream_id: Option<u32>,
     }
 
-    impl From<ChannelType> for DvbFreq {
-        fn from(value: ChannelType) -> Self {
-            let freq: IoctlFreq = value.clone().into();
+    impl TryFrom<ChannelType> for DvbFreq {
+        type Error = io::Error;
 
-            let hz: u32 = match &value {
+        fn try_from(value: ChannelType) -> Result<Self, Self::Error> {
+            // Satellite frontends expect this field in kHz despite its historic
+            // `freq_hz` name. Terrestrial and CATV values are in Hz.
+            let freq_hz: u32 = match &value {
                 ChannelType::Terrestrial(ch_num, ..) => {
-                    /* UHF 13-62ch */
+                    if !(13..=62).contains(ch_num) {
+                        return invalid_channel(&value);
+                    }
                     let ch_num = *ch_num as u32;
                     473142857 + (ch_num - 13) * 6000000
                 }
                 ChannelType::Catv(ch_num, ..) => {
-                    /* CATV C13-C22ch */
                     let ch_num = *ch_num as u32;
-                    if ch_num >= 13 && ch_num <= 22 {
+                    if (13..=22).contains(&ch_num) {
                         111142857 + (ch_num - 13) * 6000000
-                    /* CATV C23-C63ch */
-                    } else if ch_num >= 23 && ch_num <= 63 {
+                    } else if (23..=63).contains(&ch_num) {
                         225142857 + (ch_num - 23) * 6000000
                     } else {
-                        unreachable!()
+                        return invalid_channel(&value);
                     }
                 }
-                ChannelType::BS(..) | ChannelType::CS(..) => {
-                    if freq.ch < 0 {
-                        unreachable!()
-                    } else if freq.ch < 12 {
-                        /* BS */
-                        (1049480 + (38360 * freq.ch)) as u32
-                    } else if freq.ch < 24 {
-                        /* CS */
-                        (1613000 + (40000 * (freq.ch - 12))) as u32
+                ChannelType::BS(ch, ..) if (1..=24).contains(ch) => {
+                    let ch = *ch as u32;
+                    if ch % 2 == 0 {
+                        2241660 + 38360 * (ch / 2 - 1)
                     } else {
-                        unreachable!()
+                        1049480 + 38360 * (ch / 2)
                     }
                 }
-
-                ChannelType::BonCh(_) | ChannelType::BonChSpace(_) => {
-                    error!("{:?} is not supported in Linux.", value);
-                    std::process::exit(-1)
+                ChannelType::CS(ch, ..) if (1..=25).contains(ch) => {
+                    let ch = *ch as u32;
+                    if ch % 2 == 0 {
+                        1613000 + 40000 * (ch / 2 - 1)
+                    } else if ch == 25 {
+                        2726000
+                    } else {
+                        2766000 + 40000 * (ch / 2)
+                    }
                 }
-                _ => unreachable!("Invalid channel."),
+                _ => return invalid_channel(&value),
             };
 
             let stream_id = match value {
@@ -105,15 +136,78 @@ pub mod output {
                 ChannelType::BS(_, TsFilter::AsIs) | ChannelType::CS(_, TsFilter::AsIs) => None,
                 ChannelType::BS(_, TsFilter::AbsTsId(id))
                 | ChannelType::CS(_, TsFilter::AbsTsId(id)) => Some(id),
-                ChannelType::BS(_, TsFilter::RelTsNum(id)) if id < 12 => Some(id as u32),
-                _ => unreachable!(),
+                ChannelType::BS(ch, TsFilter::RelTsNum(slot)) => {
+                    Some(relative_stream_id(ch, slot).ok_or_else(|| {
+                        io::Error::new(
+                            ErrorKind::InvalidInput,
+                            format!("BS{ch}_{slot} has no known stream ID; specify --tsid"),
+                        )
+                    })?)
+                }
+                ChannelType::CS(_, TsFilter::RelTsNum(_)) => {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "relative stream IDs are only defined for BS channels",
+                    ))
+                }
+                _ => return invalid_channel(&value),
             };
 
-            Self {
-                freq_hz: hz,
-                stream_id,
-            }
+            Ok(Self { freq_hz, stream_id })
         }
+    }
+
+    fn invalid_channel(value: &ChannelType) -> io::Result<DvbFreq> {
+        Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("invalid or unsupported channel: {value:?}"),
+        ))
+    }
+
+    fn relative_stream_id(ch: u8, slot: i32) -> Option<u32> {
+        const STREAM_IDS: &[((u8, i32), u32)] = &[
+            ((1, 0), 16400),
+            ((1, 1), 16401),
+            ((1, 2), 16402),
+            ((3, 0), 16432),
+            ((3, 1), 17969),
+            ((3, 2), 17970),
+            ((5, 0), 17488),
+            ((5, 1), 17489),
+            ((9, 0), 16528),
+            ((9, 1), 16530),
+            ((13, 0), 16592),
+            ((13, 1), 16593),
+            ((13, 2), 18130),
+            ((15, 0), 16625),
+            ((15, 1), 16626),
+            ((15, 2), 18675),
+            ((19, 0), 18224),
+            ((19, 1), 18225),
+            ((19, 2), 18226),
+            ((19, 3), 18227),
+            ((21, 0), 18256),
+            ((21, 1), 18257),
+            ((21, 2), 18258),
+            ((23, 0), 18288),
+            ((23, 1), 18801),
+            ((23, 2), 18803),
+            ((7, 0), 0xb070),
+            ((7, 1), 0xb071),
+            ((7, 2), 0xb072),
+            ((11, 0), 0xb0b0),
+            ((11, 1), 0xb0b1),
+            ((11, 2), 0xb0b2),
+            ((14, 0), 0xb0e0),
+            ((17, 0), 0xb110),
+            ((17, 1), 0xb111),
+            ((17, 2), 0xb112),
+        ];
+        STREAM_IDS
+            .iter()
+            .find_map(|&((mapped_ch, mapped_slot), id)| {
+                (mapped_ch == ch && mapped_slot == slot).then_some(id)
+            })
     }
 }
 
@@ -166,22 +260,6 @@ pub mod representation {
     }
 }
 
-mod parser {
-    use nom::branch::alt;
-    use nom::bytes::complete::tag;
-    use nom::character::complete::u32;
-    use nom::sequence::separated_pair;
-    use nom::{IResult, Parser};
-
-    pub(crate) fn get_result(input: &str) -> IResult<&str, &str> {
-        alt((tag("BS"), tag("CS"), tag("T"), tag("C"))).parse(input)
-    }
-
-    pub(crate) fn parse_integer_pair(input: &str) -> IResult<&str, (u32, u32)> {
-        separated_pair(u32, alt((tag("-"), tag("_"))), u32).parse(input)
-    }
-}
-
 pub struct Channel {
     pub ch_type: ChannelType,
     raw_string: String,
@@ -193,103 +271,42 @@ impl Channel {
         self.raw_string.as_str()
     }
 
+    pub fn stream_format(&self) -> StreamFormat {
+        self.ch_type.stream_format()
+    }
+
     pub fn new(ch_str: impl Into<String>, override_stream_id: Option<u32>) -> Self {
         let raw_string = ch_str.into();
 
         let ch_type = if let Ok(val) = raw_string.parse::<u8>() {
             ChannelType::BonCh(val)
         } else {
-            // Parse
-            match parser::get_result(&raw_string) {
-                Ok((bottom, "BS")) => {
-                    if let Ok(ch) = bottom.parse() {
-                        match override_stream_id {
-                            None => ChannelType::BS(ch, AsIs),
-                            Some(id) => ChannelType::BS(ch, AbsTsId(id)),
-                        }
-                    } else {
-                        match (parser::parse_integer_pair(bottom), override_stream_id) {
-                            (Ok((_, (first, _))), Some(id)) => {
-                                ChannelType::BS(first as u8, AbsTsId(id))
-                            }
-                            (Ok((_, (first, second))), None) => {
-                                ChannelType::BS(first as u8, RelTsNum(second as i32))
-                            }
-
-                            (Err(_), _) => ChannelType::Undefined,
-                        }
-                    }
-                }
-                Ok((bottom, "CS")) => match (bottom.parse(), override_stream_id) {
-                    (Ok(ch), Some(id)) => ChannelType::CS(ch, AbsTsId(id)),
-                    (Ok(ch), None) => ChannelType::CS(ch, AsIs),
-
-                    (Err(_), _) => ChannelType::Undefined,
-                },
-                Ok((bottom, "C")) if override_stream_id.is_none() => {
-                    if let Ok(ch) = bottom.parse() {
-                        ChannelType::Catv(ch, AsIs)
-                    } else {
-                        ChannelType::Undefined
-                    }
-                }
-                Ok((bottom, "T")) if override_stream_id.is_none() => {
-                    if let Ok(ch) = bottom.parse() {
-                        ChannelType::Terrestrial(ch, AsIs)
-                    } else {
-                        ChannelType::Undefined
-                    }
-                }
-                _ => match parser::parse_integer_pair(&raw_string) {
-                    Ok((_, (first, second))) => ChannelType::BonChSpace(ChannelSpace {
-                        space: first,
-                        ch: second,
-                        space_description: None,
-                        ch_description: None,
-                    }),
-                    Err(_) => ChannelType::Undefined,
-                },
-            }
+            parse_channel_type(&raw_string, override_stream_id)
         };
 
         let assert_range = |from, to, ch: &u8| {
             if !(from..=to).contains(ch) {
-                error!("Channel value {ch} out of range. It must be from 13 to 63.")
+                error!("Channel value {ch} out of range. It must be from {from} to {to}.")
             }
             (from..=to).contains(ch)
         };
-        // Verify
         let consistent = match &ch_type {
             ChannelType::Terrestrial(ch, _) => assert_range(13, 62, ch),
             ChannelType::Catv(ch, _) => assert_range(13, 63, ch),
             ChannelType::BS(ch, id) => {
-                if *ch == 7 || *ch == 17 {
-                    warn!("BS-7ch and BS-17ch are ISDB-S3.");
-                    false
-                } else if *ch % 2 == 0 {
-                    warn!("The BS channel must be an odd number.");
-                    false
-                } else if matches!(id, RelTsNum(num) if !(0..8).contains(num)) {
-                    warn!("The relative TS number is up to 8.");
+                if matches!(id, RelTsNum(num) if *num < 0) {
+                    warn!("The relative TS number cannot be negative.");
                     false
                 } else {
-                    assert_range(1, 23, ch)
+                    assert_range(1, 24, ch)
                 }
             }
-            ChannelType::CS(ch, _) => {
-                if *ch % 2 != 0 {
-                    warn!("The CS channel must be an even number.");
-                    false
-                } else {
-                    assert_range(2, 24, ch)
-                }
-            }
-            ChannelType::BonChSpace(_) => true,
+            ChannelType::CS(ch, _) => assert_range(1, 25, ch),
+            ChannelType::BonCh(_) | ChannelType::BonChSpace(_) => true,
             _ => false,
         };
 
         if consistent {
-            // Set
             Self {
                 ch_type,
                 raw_string,
@@ -301,6 +318,95 @@ impl Channel {
             }
         }
     }
+}
+
+impl ChannelType {
+    pub fn stream_format(&self) -> StreamFormat {
+        match self {
+            ChannelType::BS(_, AbsTsId(id)) | ChannelType::CS(_, AbsTsId(id))
+                if (0xb000..=0xbfff).contains(id) || (0xc000..=0xcfff).contains(id) =>
+            {
+                StreamFormat::Tlv
+            }
+            ChannelType::BS(7 | 11 | 17, _) => StreamFormat::Tlv,
+            ChannelType::BS(ch, _) if ch % 2 == 0 => StreamFormat::Tlv,
+            ChannelType::CS(ch, _) if ch % 2 != 0 => StreamFormat::Tlv,
+            _ => StreamFormat::Ts,
+        }
+    }
+}
+
+fn parse_channel_type(raw: &str, override_stream_id: Option<u32>) -> ChannelType {
+    if let Some(suffix) = raw.strip_prefix("BS") {
+        let Some((channel, slot)) = parse_channel_and_slot(suffix) else {
+            return ChannelType::Undefined;
+        };
+        return match (slot, override_stream_id) {
+            (_, Some(id)) => ChannelType::BS(channel, AbsTsId(id)),
+            (Some(slot), None) => ChannelType::BS(channel, RelTsNum(slot)),
+            (None, None) => ChannelType::BS(channel, AsIs),
+        };
+    }
+    if let Some(suffix) = raw.strip_prefix("CS") {
+        let Some((channel, None)) = parse_channel_and_slot(suffix) else {
+            return ChannelType::Undefined;
+        };
+        return match override_stream_id {
+            Some(id) => ChannelType::CS(channel, AbsTsId(id)),
+            None => ChannelType::CS(channel, AsIs),
+        };
+    }
+    if let Some(suffix) = raw.strip_prefix('C') {
+        return if override_stream_id.is_none() {
+            suffix
+                .parse::<u8>()
+                .map_or(ChannelType::Undefined, |channel| {
+                    ChannelType::Catv(channel, AsIs)
+                })
+        } else {
+            ChannelType::Undefined
+        };
+    }
+    if let Some(suffix) = raw.strip_prefix('T') {
+        return if override_stream_id.is_none() {
+            suffix
+                .parse::<u8>()
+                .map_or(ChannelType::Undefined, |channel| {
+                    ChannelType::Terrestrial(channel, AsIs)
+                })
+        } else {
+            ChannelType::Undefined
+        };
+    }
+    if let Some((space, channel)) = parse_pair(raw) {
+        ChannelType::BonChSpace(ChannelSpace {
+            space,
+            ch: channel,
+            space_description: None,
+            ch_description: None,
+        })
+    } else {
+        ChannelType::Undefined
+    }
+}
+
+fn parse_channel_and_slot(input: &str) -> Option<(u8, Option<i32>)> {
+    match parse_pair(input) {
+        Some((channel, slot)) => {
+            Some((u8::try_from(channel).ok()?, Some(i32::try_from(slot).ok()?)))
+        }
+        None => Some((input.parse::<u8>().ok()?, None)),
+    }
+}
+
+fn parse_pair(input: &str) -> Option<(u32, u32)> {
+    let separator = input.find(|ch| ch == '-' || ch == '_')?;
+    let (first, rest) = input.split_at(separator);
+    let second = &rest[1..];
+    if first.is_empty() || second.is_empty() || second.chars().any(|ch| ch == '-' || ch == '_') {
+        return None;
+    }
+    Some((first.parse().ok()?, second.parse().ok()?))
 }
 
 #[cfg(test)]
@@ -389,17 +495,17 @@ mod tests {
 
         let ch_str = "BS4_2";
         let ch = Channel::new(ch_str, None);
-        assert_eq!(ch.ch_type, ChannelType::Undefined);
+        assert_eq!(ch.ch_type, ChannelType::BS(4, RelTsNum(2)));
         assert_eq!(ch.raw_string, ch_str.to_string());
 
         let ch_str = "BS06_0";
         let ch = Channel::new(ch_str, None);
-        assert_eq!(ch.ch_type, ChannelType::Undefined);
+        assert_eq!(ch.ch_type, ChannelType::BS(6, RelTsNum(0)));
         assert_eq!(ch.raw_string, ch_str.to_string());
 
         let ch_str = "BS07_2";
         let ch = Channel::new(ch_str, None);
-        assert_eq!(ch.ch_type, ChannelType::Undefined);
+        assert_eq!(ch.ch_type, ChannelType::BS(7, RelTsNum(2)));
         assert_eq!(ch.raw_string, ch_str.to_string());
 
         let ch_str = "BS13_3";
@@ -409,12 +515,12 @@ mod tests {
 
         let ch_str = "BS17_1";
         let ch = Channel::new(ch_str, None);
-        assert_eq!(ch.ch_type, ChannelType::Undefined);
+        assert_eq!(ch.ch_type, ChannelType::BS(17, RelTsNum(1)));
         assert_eq!(ch.raw_string, ch_str.to_string());
 
         let ch_str = "BS19_9";
         let ch = Channel::new(ch_str, None);
-        assert_eq!(ch.ch_type, ChannelType::Undefined);
+        assert_eq!(ch.ch_type, ChannelType::BS(19, RelTsNum(9)));
         assert_eq!(ch.raw_string, ch_str.to_string());
 
         let ch_str = "BS25_3";
@@ -432,7 +538,7 @@ mod tests {
 
         let ch_str = "CS01";
         let ch = Channel::new(ch_str, None);
-        assert_eq!(ch.ch_type, ChannelType::Undefined);
+        assert_eq!(ch.ch_type, ChannelType::CS(1, AsIs));
         assert_eq!(ch.raw_string, ch_str.to_string());
 
         let ch_str = "CS2";
@@ -442,7 +548,7 @@ mod tests {
 
         let ch_str = "CS03";
         let ch = Channel::new(ch_str, None);
-        assert_eq!(ch.ch_type, ChannelType::Undefined);
+        assert_eq!(ch.ch_type, ChannelType::CS(3, AsIs));
         assert_eq!(ch.raw_string, ch_str.to_string());
 
         let ch_str = "CS04";
@@ -457,7 +563,7 @@ mod tests {
 
         let ch_str = "CS25";
         let ch = Channel::new(ch_str, None);
-        assert_eq!(ch.ch_type, ChannelType::Undefined);
+        assert_eq!(ch.ch_type, ChannelType::CS(25, AsIs));
         assert_eq!(ch.raw_string, ch_str.to_string());
 
         let ch_str = "CS26";
@@ -468,6 +574,9 @@ mod tests {
 
     #[test]
     fn test_bon_chspace_from_str() {
+        let channel = Channel::new("8", None);
+        assert_eq!(channel.ch_type, ChannelType::BonCh(8));
+
         let ch_str = "1-2";
         let ch = Channel::new(ch_str, None);
         assert_eq!(
@@ -486,8 +595,79 @@ mod tests {
     fn ch_to_ioctl_freq() {
         let ch_str = "T18";
         let ch = Channel::new(ch_str, None);
-        let freq: IoctlFreq = ch.ch_type.into();
+        let freq = IoctlFreq::try_from(ch.ch_type).unwrap();
         assert_eq!(freq.ch, 68);
         assert_eq!(freq.slot, 0);
+    }
+
+    #[test]
+    fn dvb_frequency_preserves_b25_mapping_and_exact_tsid() {
+        let b25 = DvbFreq::try_from(Channel::new("BS03_1", None).ch_type).unwrap();
+        assert_eq!(b25.freq_hz, 1087840);
+        assert_eq!(b25.stream_id, Some(17969));
+
+        let explicit = DvbFreq::try_from(Channel::new("BS03", Some(7)).ch_type).unwrap();
+        assert_eq!(explicit.stream_id, Some(7));
+    }
+
+    #[test]
+    fn s3_streams_have_tlv_format_frequency_and_normalized_aliases() {
+        let aliases = ["BS7_0", "BS07-0"];
+        for alias in aliases {
+            let channel = Channel::new(alias, None);
+            assert_eq!(channel.ch_type, ChannelType::BS(7, RelTsNum(0)));
+            assert_eq!(channel.stream_format(), StreamFormat::Tlv);
+            let freq = DvbFreq::try_from(channel.ch_type).unwrap();
+            assert_eq!(freq.freq_hz, 1164560);
+            assert_eq!(freq.stream_id, Some(0xb070));
+        }
+
+        let eight_k = DvbFreq::try_from(Channel::new("BS14_0", None).ch_type).unwrap();
+        assert_eq!(eight_k.freq_hz, 2471820);
+        assert_eq!(eight_k.stream_id, Some(0xb0e0));
+
+        let cs = Channel::new("CS25", None);
+        assert_eq!(cs.stream_format(), StreamFormat::Tlv);
+        assert_eq!(DvbFreq::try_from(cs.ch_type).unwrap().freq_hz, 2726000);
+    }
+
+    #[test]
+    fn explicit_s3_tsid_selects_tlv_without_rewriting_the_id() {
+        let channel = Channel::new("BS03", Some(0xb070));
+        assert_eq!(channel.stream_format(), StreamFormat::Tlv);
+        assert_eq!(
+            DvbFreq::try_from(channel.ch_type).unwrap().stream_id,
+            Some(0xb070)
+        );
+    }
+
+    #[test]
+    fn missing_relative_slot_is_an_input_error_not_a_no_stream_filter() {
+        let channel = Channel::new("BS19_9", None);
+        let error = DvbFreq::try_from(channel.ch_type).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn character_device_rejects_s3_before_ioctl() {
+        let error = IoctlFreq::try_from(Channel::new("BS07_0", None).ch_type).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("ISDB-S3"));
+    }
+
+    #[test]
+    fn parser_fully_consumes_numeric_suffixes() {
+        assert_eq!(
+            Channel::new("BS7_0junk", None).ch_type,
+            ChannelType::Undefined
+        );
+        assert_eq!(
+            Channel::new("BS256_0", None).ch_type,
+            ChannelType::Undefined
+        );
+        assert_eq!(
+            Channel::new("1-2junk", None).ch_type,
+            ChannelType::Undefined
+        );
     }
 }

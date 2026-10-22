@@ -1,7 +1,9 @@
 [workspace]
 resolver = "2"
+default-members = ["b25-sys", "recisdb-rs"]
 members = [
   "b25-sys",
+  "b61-sys",
   "recisdb-rs"
 ]
 

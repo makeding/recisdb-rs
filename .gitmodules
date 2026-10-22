@@ -1,3 +1,6 @@
 [submodule "b25-sys/externals/libaribb25"]
 	path = b25-sys/externals/libaribb25
 	url = https://github.com/tsukumijima/libaribb25.git
+[submodule "b61-sys/externals/libaribb61"]
+	path = b61-sys/externals/libaribb61
+	url = https://github.com/makeding/libaribb61.git

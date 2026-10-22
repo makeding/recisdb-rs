@@ -33,6 +33,7 @@ impl UnTunedTuner {
         Ok(Self { file, buf_sz })
     }
     pub fn tune(self, ch: Channel, lnb: Option<Voltage>) -> Result<Tuner, std::io::Error> {
+        let frequency = IoctlFreq::try_from(ch.ch_type.clone())?;
         // Clone the file descriptor: one copy is kept for ioctl operations
         // (tuning, signal quality, LNB control), and the original is moved
         // into the ThreadedReader for continuous data streaming.
@@ -46,7 +47,7 @@ impl UnTunedTuner {
             _ => unsafe { ptx_disable_lnb(ioctl_file.as_raw_fd())? },
         };
 
-        let _errno = unsafe { set_ch(ioctl_file.as_raw_fd(), &ch.ch_type.clone().into())? };
+        let _errno = unsafe { set_ch(ioctl_file.as_raw_fd(), &frequency)? };
 
         let _errno = unsafe { start_rec(ioctl_file.as_raw_fd())? };
 
@@ -148,7 +149,8 @@ impl Tuner {
         }
     }
     fn tune(mut self, ch: Channel, lnb: Option<Voltage>) -> Result<Tuner, std::io::Error> {
-        let _errno = unsafe { set_ch(self.ioctl_file.as_raw_fd(), &ch.ch_type.clone().into())? };
+        let frequency = IoctlFreq::try_from(ch.ch_type.clone())?;
+        let _errno = unsafe { set_ch(self.ioctl_file.as_raw_fd(), &frequency)? };
 
         let _errno = match lnb {
             Some(Voltage::_11v) => unsafe { ptx_enable_lnb(self.ioctl_file.as_raw_fd(), 1)? },

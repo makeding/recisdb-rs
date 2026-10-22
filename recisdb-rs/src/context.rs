@@ -109,10 +109,16 @@ pub(crate) enum Commands {
         #[clap(short = 'e', long)]
         exit_on_card_error: bool,
 
-        /// Disable ARIB STD-B25 decoding.{n}
-        /// If this flag is specified, ARIB STD-B25 decoding is not performed.
+        /// Record raw bytes without B25/B61 decoding.
         #[clap(long = "no-decode")]
         no_decode: bool,
+        /// Decode an ISDB-S3 B61 TLV stream instead of an ISDB B25 TS stream.
+        /// Known ISDB-S3 channels select B61 automatically.
+        #[clap(long, conflicts_with_all = ["no_decode", "card", "no_simd", "key0", "key1"])]
+        b61: bool,
+        /// CAS proxy endpoint for B61 decoding.
+        #[clap(long, conflicts_with = "no_decode", value_name = "ADDRESS")]
+        cas_proxy: Option<String>,
         /// Disable SIMD in MULTI2 processing.
         #[clap(long = "no-simd")]
         no_simd: bool,
@@ -149,7 +155,7 @@ pub(crate) enum Commands {
         #[clap(required = true)]
         output: Option<String>,
     },
-    /// Perform ARIB STD-B25 decoding on TS stream.
+    /// Decode a B25 TS stream, or a B61 TLV stream with --b61.
     #[clap(group(
     ArgGroup::new("key")
     .args(& ["key0", "key1"])
@@ -171,6 +177,13 @@ pub(crate) enum Commands {
         /// If this flag is specified, the decoder won't discard meaningless packets automatically.
         #[clap(long = "no-strip")]
         no_strip: bool,
+
+        /// Decode an ISDB-S3 B61 TLV stream instead of an ISDB B25 TS stream.
+        #[clap(long, conflicts_with_all = ["card", "no_simd", "key0", "key1"])]
+        b61: bool,
+        /// CAS proxy endpoint for B61 decoding.
+        #[clap(long, requires = "b61", value_name = "ADDRESS")]
+        cas_proxy: Option<String>,
 
         /// The card reader name.
         #[clap(long)]
