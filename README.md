@@ -112,6 +112,19 @@ The initial B61 backend handles libaribb61's compressed-IP/AES scope and can
 leave packets encrypted when keys are unavailable. Successful file I/O is not
 proof that every packet was descrambled.
 
+> [!NOTE]
+> **Messages during BS4K recording**
+>
+> - `frequency ... is out of LNBf Japan 110BS/CS LNBf range`: unpatched
+>   libdvbv5 can check the intermediate frequency (IF) supplied by recisdb
+>   against the LNB's radio-frequency (RF) range. If the tuner has locked and
+>   the recording plays normally, this message can be ignored. The
+>   recisdb-specific libdvbv5 IF patch avoids this message.
+> - `libaribb61 accepted input but left one or more packets encrypted`:
+>   processing continues, but some packets remain encrypted. If the intended
+>   programme plays normally, this warning can be ignored; it does not mean
+>   that every service in the recorded stream has been descrambled.
+
 ### Channel
 
 `-c` または `--channel` でのチャンネル指定フォーマットは下記の通りです。  
