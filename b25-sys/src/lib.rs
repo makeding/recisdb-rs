@@ -62,6 +62,10 @@ impl Default for DecoderOptions {
 }
 
 impl StreamDecoder {
+    pub fn reset(&mut self) -> std::io::Result<()> {
+        self.inner.lock().unwrap().reset()
+    }
+
     pub fn new(opt: DecoderOptions) -> Result<Self, Error> {
         let inner = unsafe {
             let inner = InnerDecoder::new(opt.enable_working_key)?;

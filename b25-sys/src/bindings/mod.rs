@@ -48,6 +48,19 @@ pin_project! {
 }
 
 impl InnerDecoder {
+    pub(crate) fn reset(&mut self) -> std::io::Result<()> {
+        self.pending_data.clear();
+        self.pending_offset = 0;
+        let code = unsafe { self.dec.as_ref().reset() };
+        if code < 0 {
+            return Err(Error::new(
+                ErrorKind::Other,
+                AribB25DecoderError::from(code),
+            ));
+        }
+        Ok(())
+    }
+
     #[allow(unused_variables)]
     pub(crate) unsafe fn new(key: bool) -> Result<Self, Error> {
         let dec = arib_std_b25::create_arib_std_b25();

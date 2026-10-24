@@ -291,6 +291,19 @@ target/release/recisdb decode -i scrambled.m2ts descrambled.m2ts
 
 ---
 
+## Decoder failure recovery
+
+When decoding is enabled, a decoder failure must not silently switch the rest of
+a recording to raw encrypted output. Recording mode resets the decoder after a
+processing failure and resumes with subsequent input, with a bounded retry limit;
+`--exit-on-card-error` and the `decode` command fail immediately instead. Decoder
+initialization failures are fatal. `--no-decode` remains explicit raw passthrough.
+Recovery can lose buffered packets and must be reported; it does not guarantee a
+gap-free recording or repair upstream tuner loss.
+
+Validation must cover transient recovery, persistent failure, strict mode, and
+explicit raw passthrough without requiring a tuner or CAS card.
+
 ## Licence
 
 [GPL v3](https://github.com/kazuki0824/recisdb-rs/blob/master/LICENSE)
