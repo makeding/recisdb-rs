@@ -1,11 +1,15 @@
 use std::io::{self, ErrorKind, Read};
 use std::os::unix::io::AsRawFd;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use futures_util::task::AtomicWaker;
+use futures_util::AsyncRead;
 use log::{debug, warn};
 
 /// Default chunk size for each read from the source device (32 KiB).
@@ -69,6 +73,9 @@ pub(crate) struct ThreadedReader {
     shutdown: Arc<AtomicBool>,
     /// Handle to the reader thread, joined on Drop for deterministic cleanup.
     reader_thread: Option<JoinHandle<()>>,
+    /// The task waiting for the next worker result. The worker wakes it after
+    /// every successful send, so no executor thread waits in `recv()`.
+    waker: Arc<AtomicWaker>,
 }
 
 impl ThreadedReader {
@@ -93,11 +100,13 @@ impl ThreadedReader {
         let (sender, receiver) = sync_channel(queue_capacity);
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
+        let waker = Arc::new(AtomicWaker::new());
+        let worker_waker = Arc::clone(&waker);
 
         let reader_thread = thread::Builder::new()
             .name("tuner-reader".to_string())
             .spawn(move || {
-                Self::reader_loop(source, sender, chunk_size, shutdown_clone);
+                Self::reader_loop(source, sender, chunk_size, shutdown_clone, worker_waker);
             })?;
 
         debug!(
@@ -113,6 +122,7 @@ impl ThreadedReader {
             offset: 0,
             shutdown,
             reader_thread: Some(reader_thread),
+            waker,
         })
     }
 
@@ -154,6 +164,7 @@ impl ThreadedReader {
         sender: SyncSender<io::Result<Vec<u8>>>,
         chunk_size: usize,
         shutdown: Arc<AtomicBool>,
+        waker: Arc<AtomicWaker>,
     ) {
         let fd = source.as_raw_fd();
 
@@ -181,6 +192,7 @@ impl ThreadedReader {
                     continue;
                 }
                 let _ = sender.send(Err(poll_error));
+                waker.wake();
                 break;
             }
 
@@ -196,6 +208,7 @@ impl ThreadedReader {
                     ErrorKind::BrokenPipe,
                     "Tuner fd became invalid while polling.",
                 )));
+                waker.wake();
                 break;
             }
 
@@ -207,6 +220,7 @@ impl ThreadedReader {
                         ErrorKind::Other,
                         "Tuner poll reported device error (POLLERR).",
                     )));
+                    waker.wake();
                     break;
                 }
                 if pollfd.revents & libc::POLLHUP != 0 {
@@ -214,6 +228,7 @@ impl ThreadedReader {
                         ErrorKind::UnexpectedEof,
                         "Tuner stream hang-up detected (POLLHUP).",
                     )));
+                    waker.wake();
                     break;
                 }
                 continue;
@@ -224,6 +239,7 @@ impl ThreadedReader {
                 // EOF: signal completion by sending an empty Vec, then exit
                 Ok(0) => {
                     let _ = sender.send(Ok(Vec::new()));
+                    waker.wake();
                     break;
                 }
                 Ok(bytes_read) => {
@@ -233,6 +249,7 @@ impl ThreadedReader {
                     if sender.send(Ok(buf)).is_err() {
                         break;
                     }
+                    waker.wake();
                 }
                 // Interrupted by a signal (EINTR): retry immediately.
                 // This is a transient condition that can occur when signals
@@ -243,9 +260,14 @@ impl ThreadedReader {
                     warn!("Tuner read interrupted by signal (EINTR), retrying...");
                     continue;
                 }
+                // The device is opened O_NONBLOCK. poll(2) only tells us
+                // that something changed; DVB read can still report EAGAIN
+                // instead of providing a full request-sized block.
+                Err(ref io_error) if io_error.kind() == ErrorKind::WouldBlock => continue,
                 // Fatal I/O error: forward to consumer and exit
                 Err(io_error) => {
                     let _ = sender.send(Err(io_error));
+                    waker.wake();
                     break;
                 }
             }
@@ -294,13 +316,17 @@ impl Drop for ThreadedReader {
     }
 }
 
-impl Read for ThreadedReader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+impl AsyncRead for ThreadedReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
         // Per the Read trait contract, a zero-length buffer must return
         // Ok(0) immediately without blocking. Without this guard, an empty
         // buf with no pending data would fall through to recv() and block.
         if buf.is_empty() {
-            return Ok(0);
+            return Poll::Ready(Ok(0));
         }
 
         // First, drain any remaining data from the previously received chunk.
@@ -316,17 +342,23 @@ impl Read for ThreadedReader {
                 self.pending.clear();
                 self.offset = 0;
             }
-            return Ok(copy_size);
+            return Poll::Ready(Ok(copy_size));
         }
 
-        // No pending data; block until the reader thread sends the next chunk
-        let receiver = match self.receiver.as_ref() {
-            Some(receiver) => receiver,
-            None => return Ok(0),
+        // Register before looking at the queue. This closes the race where
+        // the worker publishes just after an empty try_recv and before the
+        // task has installed its waker.
+        self.waker.register(cx.waker());
+
+        // Do not block the executor thread; the worker wakes the registered
+        // task after publishing a result.
+        let result = match self.receiver.as_ref() {
+            Some(receiver) => receiver.try_recv(),
+            None => return Poll::Ready(Ok(0)),
         };
-        match receiver.recv() {
-            // EOF signaled by the reader thread (empty Vec)
-            Ok(Ok(data)) if data.is_empty() => Ok(0),
+        match result {
+            // EOF signaled by the reader thread (empty Vec).
+            Ok(Ok(data)) if data.is_empty() => Poll::Ready(Ok(0)),
             Ok(Ok(data)) => {
                 let copy_size = data.len().min(buf.len());
                 buf[..copy_size].copy_from_slice(&data[..copy_size]);
@@ -336,12 +368,13 @@ impl Read for ThreadedReader {
                     self.pending = data;
                     self.offset = copy_size;
                 }
-                Ok(copy_size)
+                Poll::Ready(Ok(copy_size))
             }
             // I/O error forwarded from the reader thread
-            Ok(Err(io_error)) => Err(io_error),
+            Ok(Err(io_error)) => Poll::Ready(Err(io_error)),
             // Sender dropped unexpectedly; treat as EOF
-            Err(_) => Ok(0),
+            Err(TryRecvError::Disconnected) => Poll::Ready(Ok(0)),
+            Err(TryRecvError::Empty) => Poll::Pending,
         }
     }
 }
@@ -349,6 +382,7 @@ impl Read for ThreadedReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::AsyncReadExt;
     use std::io::Write;
     use std::os::unix::io::FromRawFd;
     use std::time::{Duration, Instant};
@@ -380,9 +414,24 @@ mod tests {
 
         let mut reader = ThreadedReader::new(read_end, 4096, 16).unwrap();
         let mut buf = vec![0u8; test_data.len()];
-        let n = reader.read(&mut buf).unwrap();
+        let n = futures_executor::block_on(reader.read(&mut buf)).unwrap();
         assert_eq!(n, test_data.len());
         assert_eq!(&buf[..n], test_data);
+    }
+
+    #[test]
+    fn test_pending_read_wakes_when_worker_publishes_data() {
+        let (read_end, mut write_end) = create_pipe();
+        let mut reader = ThreadedReader::new(read_end, 4096, 16).unwrap();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            write_end.write_all(b"wake").unwrap();
+        });
+        let mut buf = [0u8; 4];
+        let n = futures_executor::block_on(reader.read(&mut buf)).unwrap();
+        writer.join().unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(&buf, b"wake");
     }
 
     /// ThreadedReader should eventually signal end-of-stream when the
@@ -399,7 +448,7 @@ mod tests {
         // via an error (POLLHUP → UnexpectedEof). Both indicate the
         // stream has ended.
         loop {
-            match reader.read(&mut buf) {
+            match futures_executor::block_on(reader.read(&mut buf)) {
                 Ok(0) => break,
                 Ok(_) => {}
                 Err(_) => break,
@@ -419,7 +468,7 @@ mod tests {
             let mut reader = ThreadedReader::new(read_end, 4096, 16).unwrap();
             // Drain so the reader thread processes EOF and exits before drop.
             let mut buf = vec![0u8; 1024];
-            let _ = reader.read(&mut buf);
+            let _ = futures_executor::block_on(reader.read(&mut buf));
         }
         let elapsed = start.elapsed();
         assert!(

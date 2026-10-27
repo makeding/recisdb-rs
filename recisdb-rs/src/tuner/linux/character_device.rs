@@ -1,9 +1,10 @@
 use std::fs::File;
 use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use futures_util::io::{AllowStdIo, BufReader};
+use futures_util::io::BufReader;
 use futures_util::{AsyncBufRead, AsyncRead};
 use log::warn;
 
@@ -29,7 +30,10 @@ pub struct UnTunedTuner {
 impl UnTunedTuner {
     pub fn new(path: String, buf_sz: usize) -> Result<Self, std::io::Error> {
         let path = std::fs::canonicalize(path)?;
-        let file = std::fs::OpenOptions::new().read(true).open(path)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)?;
         Ok(Self { file, buf_sz })
     }
     pub fn tune(self, ch: Channel, lnb: Option<Voltage>) -> Result<Tuner, std::io::Error> {
@@ -72,7 +76,7 @@ impl UnTunedTuner {
             // is dropped last, which terminates the reader thread.
             _lnb_capab: lnb_capab,
             ioctl_file,
-            inner: BufReader::with_capacity(self.buf_sz, AllowStdIo::new(reader)),
+            inner: BufReader::with_capacity(self.buf_sz, reader),
             channel: ch,
         })
     }
@@ -91,7 +95,7 @@ pub struct Tuner {
     // and can be used from the main thread concurrently with the reader
     // thread's read operations.
     ioctl_file: File,
-    inner: BufReader<AllowStdIo<ThreadedReader>>,
+    inner: BufReader<ThreadedReader>,
     channel: Channel,
 }
 

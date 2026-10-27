@@ -2,7 +2,7 @@ use crate::utils::StreamExitType;
 use clap::Parser;
 use futures_executor::block_on;
 use futures_time::future::FutureExt;
-use log::{debug, info};
+use log::{debug, error, info};
 
 #[cfg(any(test, target_os = "linux", target_os = "windows"))]
 mod channels;
@@ -60,7 +60,10 @@ fn main() {
     match result {
         StreamExitType::Success(_) => {}
         StreamExitType::Timeout => {}
-        StreamExitType::Error(_) => {}
+        StreamExitType::Error(e) => {
+            error!("Recording failed: {e}");
+            std::process::exit(1);
+        }
         StreamExitType::UnexpectedEofInTuner => {}
     }
 }

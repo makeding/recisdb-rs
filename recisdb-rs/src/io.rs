@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 
 use futures_util::io::{AllowStdIo, BufReader};
+use futures_util::task::AtomicWaker;
 use futures_util::{AsyncBufRead, AsyncWrite};
 use log::{error, info, warn};
 use pin_project_lite::pin_project;
@@ -73,6 +74,7 @@ pin_project! {
         amt: u64,
         recovery: DecoderRecovery,
         abort: Arc<AtomicBool>,
+        abort_waker: Arc<AtomicWaker>,
         progress_tx: std::sync::mpsc::Sender<u64>,
     }
 }
@@ -106,9 +108,14 @@ impl AsyncInOutTriple {
 
         let abort: Arc<AtomicBool> = Default::default();
         let weak = Arc::downgrade(&abort);
+        let abort_waker = Arc::new(AtomicWaker::new());
+        let signal_waker = Arc::downgrade(&abort_waker);
         ctrlc::set_handler(move || {
             if let Some(ptr) = weak.upgrade() {
-                ptr.store(true, Ordering::Relaxed)
+                ptr.store(true, Ordering::Relaxed);
+            }
+            if let Some(waker) = signal_waker.upgrade() {
+                waker.wake();
             }
         })
         .expect("Error setting Ctrl-C handler");
@@ -121,6 +128,7 @@ impl AsyncInOutTriple {
                 dec,
                 amt: 0,
                 abort,
+                abort_waker,
                 progress_tx,
                 recovery: DecoderRecovery {
                     enabled: continue_on_error,
@@ -158,6 +166,7 @@ impl DecoderBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::AsyncRead;
     use std::io::{Read, Write};
     use std::sync::Mutex;
 
@@ -200,6 +209,22 @@ mod tests {
             Ok(())
         }
     }
+    struct PendingInput;
+    impl AsyncRead for PendingInput {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+    }
+    impl AsyncBufRead for PendingInput {
+        fn poll_fill_buf(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+            Poll::Pending
+        }
+        fn consume(self: Pin<&mut Self>, _amt: usize) {}
+    }
     fn run(failures: usize, enabled: bool, raw: bool) -> (io::Result<u64>, Vec<u8>) {
         let output = Arc::new(Mutex::new(Vec::new()));
         let (progress_tx, _rx) = std::sync::mpsc::channel();
@@ -225,6 +250,7 @@ mod tests {
                 attempts: 0,
             },
             abort: Arc::new(AtomicBool::new(false)),
+            abort_waker: Arc::new(AtomicWaker::new()),
             progress_tx,
         };
         let result = futures_executor::block_on(body);
@@ -255,6 +281,32 @@ mod tests {
         assert_eq!(result.unwrap(), 5);
         assert_eq!(output, b"abcde");
     }
+    #[test]
+    fn raw_abort_wakes_a_pending_input_read() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let (progress_tx, _rx) = std::sync::mpsc::channel();
+        let abort = Arc::new(AtomicBool::new(false));
+        let abort_waker = Arc::new(AtomicWaker::new());
+        let body = AsyncInOutTriple {
+            i: Box::new(BufReader::new(PendingInput)),
+            o: AllowStdIo::new(Box::new(Output(output))),
+            dec: RefCell::new(None),
+            amt: 0,
+            recovery: DecoderRecovery {
+                enabled: false,
+                attempts: 0,
+            },
+            abort: Arc::clone(&abort),
+            abort_waker: Arc::clone(&abort_waker),
+            progress_tx,
+        };
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            abort.store(true, Ordering::Relaxed);
+            abort_waker.wake();
+        });
+        assert_eq!(futures_executor::block_on(body).unwrap(), 0);
+    }
 }
 
 struct DecoderRecovery {
@@ -284,6 +336,7 @@ impl Future for AsyncInOutTriple {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
 
+        this.abort_waker.register(cx.waker());
         let _ = this.progress_tx.send(*this.amt);
 
         match this.dec.get_mut() {
@@ -373,8 +426,12 @@ impl Future for AsyncInOutTriple {
             }
             _ => {
                 // pass through
+                if this.abort.load(Ordering::Relaxed) {
+                    ready!(Pin::new(&mut this.o).poll_flush(cx))?;
+                    return Poll::Ready(Ok(*this.amt));
+                }
                 let buffer = ready!(this.i.as_mut().poll_fill_buf(cx))?;
-                if buffer.is_empty() || this.abort.load(Ordering::Relaxed) {
+                if buffer.is_empty() {
                     ready!(Pin::new(&mut this.o).poll_flush(cx))?;
                     return Poll::Ready(Ok(*this.amt));
                 }

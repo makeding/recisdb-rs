@@ -10,12 +10,12 @@ use dvbv5_sys::{
     DTV_ISDBT_LAYER_ENABLED, DTV_ISDBT_PARTIAL_RECEPTION, DTV_ISDBT_SOUND_BROADCASTING, DTV_STATUS,
     DTV_STAT_CNR, DTV_STREAM_ID, DTV_VOLTAGE, NO_STREAM_ID_FILTER,
 };
-use futures_util::io::{AllowStdIo, BufReader};
+use futures_util::io::BufReader;
 use futures_util::{AsyncBufRead, AsyncRead};
 use log::{error, info};
 use std::ffi::c_uint;
-use std::fs::File;
 use std::io::Error;
+use std::os::unix::fs::OpenOptionsExt;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -151,10 +151,13 @@ impl UnTunedTuner {
         // background thread continuously drains the kernel's DVB buffer,
         // preventing data drops when the downstream decoder pipeline blocks
         // (e.g., during B-CAS card ECM processing on high-bitrate CS channels).
-        let dvr_file = File::open(format!("/dev/dvb/adapter{}/dvr{}", self.id.0, self.id.1))?;
+        let dvr_file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(format!("/dev/dvb/adapter{}/dvr{}", self.id.0, self.id.1))?;
         let reader = ThreadedReader::with_defaults(dvr_file)?;
         Ok(Tuner {
-            stream: BufReader::with_capacity(self.buf_sz, AllowStdIo::new(reader)),
+            stream: BufReader::with_capacity(self.buf_sz, reader),
             inner: self,
             state: TunedDvbInternalState::Locked,
         })
@@ -170,7 +173,7 @@ pub struct Tuner {
     // empty ring buffer, causing join() to deadlock. By dropping `stream`
     // first, the reader thread can exit (shutdown flag + receiver dropped)
     // while the device is still actively supplying data.
-    stream: BufReader<AllowStdIo<ThreadedReader>>,
+    stream: BufReader<ThreadedReader>,
     state: TunedDvbInternalState,
     inner: UnTunedTuner,
 }
