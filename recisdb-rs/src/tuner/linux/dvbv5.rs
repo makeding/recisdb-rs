@@ -3,16 +3,15 @@ use crate::channels::{Channel, ChannelType};
 use crate::tuner::Voltage;
 use dvbv5::{DmxFd, FrontendId, FrontendParametersPtr};
 use dvbv5_sys::fe_delivery_system::{SYS_ISDBS, SYS_ISDBT};
-use dvbv5_sys::fe_sec_voltage::{SEC_VOLTAGE_13, SEC_VOLTAGE_18};
 use dvbv5_sys::fe_status::FE_HAS_LOCK;
 use dvbv5_sys::{
     dmx_output, dmx_ts_pes, dvb_set_compat_delivery_system, DTV_BANDWIDTH_HZ, DTV_FREQUENCY,
     DTV_ISDBT_LAYER_ENABLED, DTV_ISDBT_PARTIAL_RECEPTION, DTV_ISDBT_SOUND_BROADCASTING, DTV_STATUS,
-    DTV_STAT_CNR, DTV_STREAM_ID, DTV_VOLTAGE, NO_STREAM_ID_FILTER,
+    DTV_STAT_CNR, DTV_STREAM_ID, NO_STREAM_ID_FILTER,
 };
 use futures_util::io::BufReader;
 use futures_util::{AsyncBufRead, AsyncRead};
-use log::{error, info};
+use log::{error, info, warn};
 use std::ffi::c_uint;
 use std::io::Error;
 use std::os::unix::fs::OpenOptionsExt;
@@ -67,6 +66,12 @@ impl UnTunedTuner {
     }
 
     pub fn tune(self, ch: Channel, lnb: Option<Voltage>) -> Result<Tuner, Error> {
+        if matches!(ch.ch_type, ChannelType::ISDBC(..) | ChannelType::J83B(..)) {
+            return Err(Error::new(
+                std::io::ErrorKind::Unsupported,
+                "ISDB-C/J.83B is not supported with DVBv5. Use a supported px4_drv character device.",
+            ));
+        }
         const WAIT_DUR: std::time::Duration = std::time::Duration::from_secs(1);
 
         let raw_freq = DvbFreq::try_from(ch.ch_type.clone())?;
@@ -106,10 +111,19 @@ impl UnTunedTuner {
                         DTV_STREAM_ID as c_uint,
                         raw_freq.stream_id.unwrap_or(NO_STREAM_ID_FILTER as u32),
                     )?;
-                    match lnb {
-                        Some(Voltage::_11v) => store(DTV_VOLTAGE, SEC_VOLTAGE_13 as u32)?,
-                        Some(Voltage::_15v) => store(DTV_VOLTAGE, SEC_VOLTAGE_18 as u32)?,
-                        _ => {}
+                    // libdvbv5 drops DTV_VOLTAGE for ISDB-S; use FE_SET_VOLTAGE directly.
+                    let lnb_rc = match lnb {
+                        Some(Voltage::_11v) => Some(dvbv5_sys::dvb_fe_sec_voltage(p, 1, 0)),
+                        Some(Voltage::_15v) => Some(dvbv5_sys::dvb_fe_sec_voltage(p, 1, 1)),
+                        _ => None,
+                    };
+                    match lnb_rc {
+                        Some(0) => info!("LNB power enabled."),
+                        Some(rc) => warn!(
+                            "Failed to enable LNB power: {}",
+                            Error::from_raw_os_error(-rc)
+                        ),
+                        None => {}
                     }
                 }
             }
