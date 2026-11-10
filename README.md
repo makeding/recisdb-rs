@@ -88,6 +88,8 @@ recisdb decode [OPTIONS] --input <file> <OUTPUT>
 `recisdb session` は、Linux DVB frontend を開いたまま標準入力から再選局を受け付けます。
 TS は標準出力へ出力し、制御応答は fd 3 へ出力します。標準 ISDB-T/S の raw または
 B25 ストリーム専用で、ISDB-S3/B61 とキャラクタデバイスには対応しません。
+衛星周波数は Linux DVB へ渡す IF と libdvbv5 が要求する RF を区別し、
+110BS LNB の本振周波数を使って変換します。初回と再選局で同じ規則を使います。
 
 ```text
 stdin: TUNE\t<id>\t<channel>\n

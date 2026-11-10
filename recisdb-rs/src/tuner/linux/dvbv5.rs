@@ -20,6 +20,24 @@ use std::task::{Context, Poll};
 
 use super::threaded_reader::ThreadedReader;
 
+fn satellite_parameters(if_khz: u32) -> Result<(u32, *const dvbv5_sys::dvb_sat_lnb), Error> {
+    // DvbFreq supplies the kernel's IF in kHz; libdvbv5 consumes RF and
+    // subtracts the configured LNB LO itself. Configure it before the first
+    // tune too, so retained sessions cannot change this interpretation.
+    let lnb = unsafe {
+        dvbv5_sys::dvb_sat_get_lnb(dvbv5_sys::dvb_sat_search_lnb(
+            b"110BS\0".as_ptr().cast(),
+        ))
+    };
+    if lnb.is_null() {
+        return Err(Error::new(std::io::ErrorKind::NotFound, "110BS LNB is unavailable"));
+    }
+    let lo_mhz = unsafe { (*lnb).lowfreq };
+    let rf_khz = lo_mhz.checked_mul(1000).and_then(|lo| if_khz.checked_add(lo))
+        .ok_or_else(|| Error::new(std::io::ErrorKind::InvalidInput, "Satellite RF frequency overflow"))?;
+    Ok((rf_khz, lnb))
+}
+
 pub struct UnTunedTuner {
     id: (u8, u8),
     frontend: FrontendParametersPtr,
@@ -83,13 +101,20 @@ impl UnTunedTuner {
                 "select delivery system",
                 dvb_set_compat_delivery_system(p, system as u32),
             )?;
+            let frequency = if system == SYS_ISDBS {
+                let (rf_khz, lnb) = satellite_parameters(raw_freq.freq_hz)?;
+                (*p).lnb = lnb;
+                rf_khz
+            } else {
+                raw_freq.freq_hz
+            };
             let store = |key, value| {
                 check_dvb_result(
                     &format!("set DVB property {key}"),
                     dvbv5_sys::dvb_fe_store_parm(p, key, value),
                 )
             };
-            store(DTV_FREQUENCY as c_uint, raw_freq.freq_hz)?;
+            store(DTV_FREQUENCY as c_uint, frequency)?;
             match &ch.ch_type {
                 ChannelType::Terrestrial(..) | ChannelType::Catv(..) => {
                     store(DTV_BANDWIDTH_HZ as c_uint, 6_000_000)?;
@@ -331,5 +356,28 @@ fn check_dvb_result(operation: &str, result: i32) -> Result<(), Error> {
         ))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn satellite_aliases_keep_kernel_if_and_supply_libdvbv5_rf() {
+        for (name, expected_if, expected_rf, tsid) in [
+            ("BS09_0", 1_202_920, 11_880_920, 0x4090),
+            ("BS9_0", 1_202_920, 11_880_920, 0x4090),
+            ("BS15_0", 1_318_000, 11_996_000, 0x40f1),
+            ("CS2", 1_613_000, 12_291_000, 0xffff_ffff),
+        ] {
+            let channel = DvbFreq::try_from(Channel::new(name, None).ch_type).unwrap();
+            assert_eq!(channel.freq_hz, expected_if);
+            assert_eq!(channel.stream_id.unwrap_or(u32::MAX), tsid);
+            let (rf, lnb) = satellite_parameters(channel.freq_hz).unwrap();
+            assert_eq!(rf, expected_rf);
+            assert_eq!(rf - unsafe { (*lnb).lowfreq } * 1000, expected_if);
+        }
+        assert!(satellite_parameters(u32::MAX).is_err());
     }
 }
