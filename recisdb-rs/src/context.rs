@@ -155,6 +155,51 @@ pub(crate) enum Commands {
         #[clap(required = true)]
         output: Option<String>,
     },
+    #[cfg(target_os = "linux")]
+    /// Keep a Linux DVB frontend open and accept channel changes on stdin.
+    #[clap(group(
+    ArgGroup::new("session-key")
+    .args(& ["key0", "key1"])
+    .requires_all(& ["key0", "key1"])
+    .multiple(true)
+    ))]
+    Session {
+        /// Linux DVB frontend path or adapter|frontend pair.
+        #[clap(short = 'i', long, value_name = "CANONICAL_PATH", required = true)]
+        device: String,
+
+        /// The card reader name.
+        #[clap(long)]
+        card: Option<String>,
+
+        /// Pass through the received transport stream without B25 decoding.
+        #[clap(long = "no-decode")]
+        no_decode: bool,
+
+        /// Exit if B25 decoding fails instead of attempting decoder recovery.
+        #[clap(short = 'e', long)]
+        exit_on_card_error: bool,
+
+        /// Disable SIMD in MULTI2 processing.
+        #[clap(long = "no-simd")]
+        no_simd: bool,
+
+        /// Disable null packet stripping.
+        #[clap(long = "no-strip")]
+        no_strip: bool,
+
+        /// LNB voltage applied to every prepared channel.
+        #[clap(value_enum, long = "lnb")]
+        lnb: Option<Voltage>,
+
+        /// The first working key (only available with the crypto feature).
+        #[clap(long = "key0")]
+        key0: Option<Vec<String>>,
+
+        /// The second working key (only available with the crypto feature).
+        #[clap(long = "key1")]
+        key1: Option<Vec<String>>,
+    },
     /// Decode a B25 TS stream, or a B61 TLV stream with --b61.
     #[clap(group(
     ArgGroup::new("key")

@@ -11,7 +11,7 @@ use dvbv5_sys::{
 };
 use futures_util::io::BufReader;
 use futures_util::{AsyncBufRead, AsyncRead};
-use log::{error, info, warn};
+use log::{info, warn};
 use std::ffi::c_uint;
 use std::io::Error;
 use std::os::unix::fs::OpenOptionsExt;
@@ -23,50 +23,41 @@ use super::threaded_reader::ThreadedReader;
 pub struct UnTunedTuner {
     id: (u8, u8),
     frontend: FrontendParametersPtr,
-    demux: DmxFd,
     pub buf_sz: usize,
 }
 
 impl UnTunedTuner {
     pub fn new(adapter_number: u8, fe_number: u8, buf_sz: usize) -> Result<Self, Error> {
-        let (frontend, demux) = {
-            let frontend_id = FrontendId {
-                adapter_number,
-                frontend_number: fe_number,
-            };
-
-            let f = match FrontendParametersPtr::new(
-                &frontend_id,
-                Some(if cfg!(debug_assertions) { 1 } else { 0 }),
-                Some(false),
-            ) {
-                Ok(f) => f,
-                Err(_) => {
-                    error!("Cannot open the device. (Something went wrong while opening DVB frontend device)");
-                    std::process::exit(1);
-                }
-            };
-            let d = match DmxFd::new(&frontend_id) {
-                Ok(d) => d,
-                Err(_) => {
-                    error!("Cannot open the device. (Something went wrong while opening DVB demux device)");
-                    std::process::exit(1);
-                }
-            };
-
-            (f, d)
+        let frontend_id = FrontendId {
+            adapter_number,
+            frontend_number: fe_number,
         };
+        let frontend = FrontendParametersPtr::new(
+            &frontend_id,
+            Some(if cfg!(debug_assertions) { 1 } else { 0 }),
+            Some(false),
+        )
+        .map_err(|_| {
+            Error::new(
+                std::io::ErrorKind::Other,
+                "Failed to open the DVB frontend device",
+            )
+        })?;
 
         Ok(Self {
             id: (adapter_number, fe_number),
             frontend,
-            demux,
             buf_sz,
         })
     }
 
-    pub fn tune(self, ch: Channel, lnb: Option<Voltage>) -> Result<Tuner, Error> {
-        if matches!(ch.ch_type, ChannelType::ISDBC(..) | ChannelType::J83B(..)) {
+    fn configure_frontend(
+        &self,
+        ch: &Channel,
+        lnb: Option<&Voltage>,
+        clear_unset_lnb: bool,
+    ) -> Result<(), Error> {
+        if matches!(&ch.ch_type, ChannelType::ISDBC(..) | ChannelType::J83B(..)) {
             return Err(Error::new(
                 std::io::ErrorKind::Unsupported,
                 "ISDB-C/J.83B is not supported with DVBv5. Use a supported px4_drv character device.",
@@ -77,7 +68,7 @@ impl UnTunedTuner {
         let raw_freq = DvbFreq::try_from(ch.ch_type.clone())?;
         unsafe {
             let p = self.frontend.get_c_ptr();
-            let system = match ch.ch_type {
+            let system = match &ch.ch_type {
                 ChannelType::Terrestrial(..) | ChannelType::Catv(..) => SYS_ISDBT,
                 ChannelType::BS(..) | ChannelType::CS(..) => SYS_ISDBS,
                 _ => {
@@ -99,7 +90,7 @@ impl UnTunedTuner {
                 )
             };
             store(DTV_FREQUENCY as c_uint, raw_freq.freq_hz)?;
-            match ch.ch_type {
+            match &ch.ch_type {
                 ChannelType::Terrestrial(..) | ChannelType::Catv(..) => {
                     store(DTV_BANDWIDTH_HZ as c_uint, 6_000_000)?;
                     store(DTV_ISDBT_PARTIAL_RECEPTION, 0)?;
@@ -111,22 +102,30 @@ impl UnTunedTuner {
                         DTV_STREAM_ID as c_uint,
                         raw_freq.stream_id.unwrap_or(NO_STREAM_ID_FILTER as u32),
                     )?;
-                    // libdvbv5 drops DTV_VOLTAGE for ISDB-S; use FE_SET_VOLTAGE directly.
-                    let lnb_rc = match lnb {
-                        Some(Voltage::_11v) => Some(dvbv5_sys::dvb_fe_sec_voltage(p, 1, 0)),
-                        Some(Voltage::_15v) => Some(dvbv5_sys::dvb_fe_sec_voltage(p, 1, 1)),
-                        _ => None,
-                    };
-                    match lnb_rc {
-                        Some(0) => info!("LNB power enabled."),
-                        Some(rc) => warn!(
-                            "Failed to enable LNB power: {}",
-                            Error::from_raw_os_error(-rc)
-                        ),
-                        None => {}
-                    }
                 }
             }
+
+            // libdvbv5 drops DTV_VOLTAGE for ISDB-S; use FE_SET_VOLTAGE
+            // directly.  A retained frontend explicitly turns it off when it
+            // was not requested, so satellite power cannot carry into the
+            // next terrestrial or unpowered session.
+            let lnb_result = match lnb {
+                Some(Voltage::_11v) => Some((dvbv5_sys::dvb_fe_sec_voltage(p, 1, 0), true)),
+                Some(Voltage::_15v) => Some((dvbv5_sys::dvb_fe_sec_voltage(p, 1, 1), true)),
+                _ if clear_unset_lnb => Some((dvbv5_sys::dvb_fe_sec_voltage(p, 0, 0), false)),
+                _ => None,
+            };
+            match lnb_result {
+                Some((0, true)) => info!("LNB power enabled."),
+                Some((0, false)) => info!("LNB power disabled."),
+                Some((rc, enabled)) => warn!(
+                    "Failed to {} LNB power: {}",
+                    if enabled { "enable" } else { "disable" },
+                    Error::from_raw_os_error(-rc)
+                ),
+                None => {}
+            }
+
             check_dvb_result("tune frontend", dvbv5_sys::dvb_fe_set_parms(p))?;
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(7);
             loop {
@@ -149,10 +148,27 @@ impl UnTunedTuner {
                 info!("Checking for the frontend lock...");
                 std::thread::sleep(WAIT_DUR);
             }
+        }
+        Ok(())
+    }
+
+    fn start_stream(&self) -> Result<ActiveStream, Error> {
+        let frontend_id = FrontendId {
+            adapter_number: self.id.0,
+            frontend_number: self.id.1,
+        };
+        let demux = DmxFd::new(&frontend_id).map_err(|_| {
+            Error::new(
+                std::io::ErrorKind::Other,
+                "Failed to open the DVB demux device",
+            )
+        })?;
+
+        unsafe {
             check_dvb_result(
                 "start DVB demux",
                 dvbv5_sys::dvb_set_pesfilter(
-                    self.demux.as_raw_fd(),
+                    demux.as_raw_fd(),
                     0x2000,
                     dmx_ts_pes::DMX_PES_OTHER,
                     dmx_output::DMX_OUT_TS_TAP,
@@ -170,34 +186,98 @@ impl UnTunedTuner {
             .custom_flags(libc::O_NONBLOCK)
             .open(format!("/dev/dvb/adapter{}/dvr{}", self.id.0, self.id.1))?;
         let reader = ThreadedReader::with_defaults(dvr_file)?;
-        Ok(Tuner {
+        Ok(ActiveStream {
             stream: BufReader::with_capacity(self.buf_sz, reader),
+            demux,
+        })
+    }
+
+    pub fn tune(self, ch: Channel, lnb: Option<Voltage>) -> Result<Tuner, Error> {
+        self.configure_frontend(&ch, lnb.as_ref(), false)?;
+        let active = self.start_stream()?;
+        Ok(Tuner {
+            active: Some(active),
+            poisoned: false,
             inner: self,
             state: TunedDvbInternalState::Locked,
         })
     }
+
+    pub fn into_session(self) -> Tuner {
+        Tuner {
+            active: None,
+            poisoned: false,
+            inner: self,
+            state: TunedDvbInternalState::Stopped,
+        }
+    }
+}
+
+struct ActiveStream {
+    // Keep this field before `demux`: the reader must be stopped before
+    // closing the demux, which issues DMX_STOP and can strand a DVR read.
+    stream: BufReader<ThreadedReader>,
+    demux: DmxFd,
 }
 
 pub struct Tuner {
-    // Field order matters for drop safety: `stream` (ThreadedReader) must
-    // be dropped BEFORE `inner` (frontend/demux). Rust drops fields in
-    // declaration order. If `inner` drops first, dvb_dmx_close() issues
-    // DMX_STOP which halts data flow to the DVR ring buffer. The reader
-    // thread in ThreadedReader may then block forever in read() on the
-    // empty ring buffer, causing join() to deadlock. By dropping `stream`
-    // first, the reader thread can exit (shutdown flag + receiver dropped)
-    // while the device is still actively supplying data.
-    stream: BufReader<ThreadedReader>,
+    // `active` must be dropped before `inner`, so the DVR reader and demux
+    // are gone before the retained frontend is closed.
+    active: Option<ActiveStream>,
+    poisoned: bool,
     state: TunedDvbInternalState,
     inner: UnTunedTuner,
 }
 
 pub enum TunedDvbInternalState {
+    Stopped,
     Locked,
     NitScan,
 }
 
 impl Tuner {
+    fn stop_stream(&mut self) -> Result<(), Error> {
+        self.state = TunedDvbInternalState::Stopped;
+        let Some(active) = self.active.take() else {
+            return Ok(());
+        };
+        let ActiveStream { stream, demux } = active;
+        let shutdown_result = stream.into_inner().shutdown();
+
+        // Close the demux only after the DVR worker has released its source.
+        drop(demux);
+
+        if let Err(error) = shutdown_result {
+            self.poisoned = true;
+            return Err(Error::new(
+                error.kind(),
+                format!("Failed to stop the previous DVB stream: {error}"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Retune while keeping the DVB frontend open.
+    ///
+    /// The previous DVR reader and demux are discarded so buffered bytes from
+    /// one channel cannot cross into the next channel.  A reader shutdown
+    /// timeout poisons the tuner; starting another stream would allow the old
+    /// worker to consume data from the new channel.
+    pub fn retune(&mut self, ch: Channel, lnb: Option<Voltage>) -> Result<(), Error> {
+        if self.poisoned {
+            return Err(Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "The DVB tuner cannot be reused after a reader shutdown failure",
+            ));
+        }
+
+        self.stop_stream()?;
+        self.inner.configure_frontend(&ch, lnb.as_ref(), true)?;
+        self.active = Some(self.inner.start_stream()?);
+        self.state = TunedDvbInternalState::Locked;
+        Ok(())
+    }
+
     pub fn signal_quality(&self) -> f64 {
         let p = self.inner.frontend.get_c_ptr();
         unsafe {
@@ -215,17 +295,31 @@ impl AsyncRead for Tuner {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
+        match self.get_mut().active.as_mut() {
+            Some(active) => Pin::new(&mut active.stream).poll_read(cx, buf),
+            None => Poll::Ready(Err(Error::new(
+                std::io::ErrorKind::NotConnected,
+                "The DVB tuner is not streaming",
+            ))),
+        }
     }
 }
 
 impl AsyncBufRead for Tuner {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<&[u8]>> {
-        Pin::new(&mut self.get_mut().stream).poll_fill_buf(cx)
+        match self.get_mut().active.as_mut() {
+            Some(active) => Pin::new(&mut active.stream).poll_fill_buf(cx),
+            None => Poll::Ready(Err(Error::new(
+                std::io::ErrorKind::NotConnected,
+                "The DVB tuner is not streaming",
+            ))),
+        }
     }
 
     fn consume(self: Pin<&mut Self>, amt: usize) {
-        Pin::new(&mut self.get_mut().stream).consume(amt)
+        if let Some(active) = self.get_mut().active.as_mut() {
+            Pin::new(&mut active.stream).consume(amt);
+        }
     }
 }
 

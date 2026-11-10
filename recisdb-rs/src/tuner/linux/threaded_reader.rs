@@ -138,6 +138,52 @@ impl ThreadedReader {
         Self::new(source, chunk_size, queue_capacity)
     }
 
+    /// Stop the worker and wait for it to release the source device.
+    ///
+    /// Unlike `Drop`, this reports a timeout to callers that need to reuse the
+    /// tuner device.  Reusing a DVR while its previous reader thread is still
+    /// alive can make that thread consume data from the next tuned channel.
+    pub(crate) fn shutdown(mut self) -> io::Result<()> {
+        self.shutdown_and_join()
+    }
+
+    fn shutdown_and_join(&mut self) -> io::Result<()> {
+        self.shutdown.store(true, Ordering::Relaxed);
+
+        // Disconnect a worker blocked on a full queue before waiting for it.
+        let _ = self.receiver.take();
+
+        let Some(handle) = self.reader_thread.take() else {
+            return Ok(());
+        };
+
+        let deadline = Instant::now() + DROP_JOIN_TIMEOUT;
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        if handle.is_finished() {
+            return handle.join().map_err(|_| {
+                io::Error::new(
+                    ErrorKind::Other,
+                    "Tuner reader thread panicked during shutdown.",
+                )
+            });
+        }
+
+        // Dropping a JoinHandle detaches the worker.  Keep the existing
+        // best-effort behavior, but report the timeout so a reusable tuner
+        // session can refuse to start another DVR reader.
+        std::mem::forget(handle);
+        Err(io::Error::new(
+            ErrorKind::TimedOut,
+            format!(
+                "Tuner reader thread did not exit within {:?}.",
+                DROP_JOIN_TIMEOUT
+            ),
+        ))
+    }
+
     fn read_usize_env(name: &str, fallback: usize) -> usize {
         match std::env::var(name) {
             Ok(raw) => match raw.parse::<usize>() {
@@ -278,40 +324,8 @@ impl ThreadedReader {
 
 impl Drop for ThreadedReader {
     fn drop(&mut self) {
-        // Signal the reader thread to exit.
-        self.shutdown.store(true, Ordering::Relaxed);
-
-        // Drop the receiver first so that a blocked sender.send() in the
-        // reader thread immediately wakes with a disconnected-channel error.
-        // Without this, if the queue is full and reader thread is blocked on
-        // send(), it cannot observe the shutdown flag and join() may hang.
-        let _ = self.receiver.take();
-
-        // Join the reader thread with a timeout to avoid deadlocking the
-        // entire drop chain when the thread is stuck in a blocking device
-        // read syscall (e.g., DVB DVR read after DMX_STOP).
-        // std::thread::JoinHandle::join() has no built-in timeout, so we
-        // poll is_finished() at short intervals.
-        if let Some(handle) = self.reader_thread.take() {
-            let deadline = Instant::now() + DROP_JOIN_TIMEOUT;
-            while !handle.is_finished() && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(50));
-            }
-
-            if handle.is_finished() {
-                let _ = handle.join();
-            } else {
-                warn!(
-                    "Tuner reader thread did not exit within {:?}; detaching.",
-                    DROP_JOIN_TIMEOUT
-                );
-                // Detach: the thread holds its own copies of the source
-                // and sender, and will exit once it observes the shutdown
-                // flag (via poll timeout) or the source yields an error.
-                // Forgetting the JoinHandle prevents join() from blocking
-                // the drop chain indefinitely.
-                std::mem::forget(handle);
-            }
+        if let Err(error) = self.shutdown_and_join() {
+            warn!("{error} Detaching the reader thread.");
         }
     }
 }

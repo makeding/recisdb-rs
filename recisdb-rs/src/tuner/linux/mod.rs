@@ -51,6 +51,17 @@ impl UnTunedTuner {
             character_device::UnTunedTuner::new(path, buf_sz)?,
         ))
     }
+
+    pub fn into_dvb_session(self) -> Result<Tuner, Error> {
+        match self {
+            #[cfg(feature = "dvb")]
+            UnTunedTuner::DvbV5(inner) => Ok(Tuner::DvbV5(inner.into_session())),
+            UnTunedTuner::Character(_) => Err(Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Persistent tuner sessions require a Linux DVB frontend",
+            )),
+        }
+    }
 }
 
 pub enum Tuner {
@@ -60,6 +71,22 @@ pub enum Tuner {
 }
 
 impl Tuner {
+    /// Retune a Linux DVB frontend without closing it.
+    ///
+    /// Character-device tuners retain their existing one-shot behavior; a
+    /// future persistent session command can use this method only after it has
+    /// selected the DVB backend.
+    pub fn retune(&mut self, ch: Channel, lnb: Option<Voltage>) -> Result<(), Error> {
+        match self {
+            #[cfg(feature = "dvb")]
+            Tuner::DvbV5(inner) => inner.retune(ch, lnb),
+            Tuner::Character(_) => Err(Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Retuning an open character-device tuner is not supported",
+            )),
+        }
+    }
+
     pub fn signal_quality(&self) -> f64 {
         match self {
             #[cfg(feature = "dvb")]
@@ -78,17 +105,6 @@ impl Tunable for UnTunedTuner {
         }
     }
 }
-// TODO: 再選局を実装する際は必要
-// impl Tunable for Tuner {
-//     fn tune(self, ch: Channel, lnb: Option<Voltage>) -> Result<Tuner, Error> {
-//         match self {
-//             #[cfg(feature = "dvb")]
-//             UnTunedTuner::DvbV5(inner) => Ok(Tuner::DvbV5(inner.tune(ch, lnb)?)),
-//             UnTunedTuner::Character(inner) => Ok(Tuner::Character(inner.tune(ch, lnb)?)),
-//         }
-//     }
-// }
-
 impl AsyncRead for Tuner {
     fn poll_read(
         self: Pin<&mut Self>,

@@ -2,6 +2,7 @@ use futures_time::time::Duration;
 use std::future::Future;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::io::Write;
+use std::pin::Pin;
 
 #[cfg(any(
     target_os = "linux",
@@ -26,6 +27,8 @@ use crate::tuner::{Tunable, UnTunedTuner};
 
 #[cfg(any(test, target_os = "linux", target_os = "windows"))]
 mod selection;
+#[cfg(target_os = "linux")]
+mod session;
 pub(crate) mod utils;
 
 /// The behavior the user requested are returned.
@@ -33,7 +36,7 @@ pub(crate) mod utils;
 pub(crate) fn process_command(
     args: Cli,
 ) -> (
-    impl Future<Output = std::io::Result<u64>>,
+    Pin<Box<dyn Future<Output = std::io::Result<u64>>>>,
     Option<Duration>,
     Option<(u64, std::sync::mpsc::Receiver<u64>)>,
 ) {
@@ -186,7 +189,42 @@ pub(crate) fn process_command(
 
             let (body, _) = AsyncInOutTriple::new(input, output, dec, !exit_on_card_error);
             info!("Recording...");
-            (body, rec_duration, None)
+            (Box::pin(body), rec_duration, None)
+        }
+        #[cfg(target_os = "linux")]
+        Commands::Session {
+            device,
+            card,
+            no_decode,
+            exit_on_card_error,
+            no_simd,
+            no_strip,
+            lnb,
+            key0,
+            key1,
+        } => {
+            if let Some(name) = card {
+                #[cfg(not(feature = "prioritized_card_reader"))]
+                warn!("--card {name} has no effect. Use `prioritized_card_reader` feature flag.");
+                #[cfg(feature = "prioritized_card_reader")]
+                b25_sys::set_card_reader_name(&name);
+            }
+            let session = session::DvbSession::new(session::SessionConfig {
+                device,
+                input_buffer_size: buf_sz,
+                lnb,
+                raw: no_decode,
+                continue_on_decoder_error: !exit_on_card_error,
+                enable_working_key: parse_keys(key0, key1),
+                simd: !no_simd,
+                strip: !no_strip,
+            })
+            .unwrap_or_else(|error| {
+                error!("Failed to create the DVB session: {error}");
+                std::process::exit(1)
+            });
+            info!("DVB session ready for control commands.");
+            (Box::pin(session), None, None)
         }
         Commands::Decode {
             source,
@@ -255,7 +293,7 @@ pub(crate) fn process_command(
 
             let (body, progress) = AsyncInOutTriple::new(input, output, dec, false);
             info!("Decoding...");
-            (body, None, input_sz.map(|sz| (sz, progress)))
+            (Box::pin(body), None, input_sz.map(|sz| (sz, progress)))
         }
         #[cfg(windows)]
         Commands::Enumerate { device, space } => {

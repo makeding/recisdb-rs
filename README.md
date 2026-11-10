@@ -52,7 +52,7 @@ Windows では `recisdb.exe` をダウンロードし、適当なフォルダに
 
 recisdb には、プラットフォームに応じて次のサブコマンドがあります。
 
-- Linux: `checksignal`, `tune`, `decode`
+- Linux: `checksignal`, `tune`, `session`, `decode`
 - Windows: `checksignal`, `tune`, `decode`, `enumerate`
 - macOS: `decode`
 
@@ -84,6 +84,22 @@ recisdb tune [OPTIONS] --device <CANONICAL_PATH> --channel <CHANNEL> <OUTPUT>
 ```bash
 recisdb decode [OPTIONS] --input <file> <OUTPUT>
 ```
+
+`recisdb session` は、Linux DVB frontend を開いたまま標準入力から再選局を受け付けます。
+TS は標準出力へ出力し、制御応答は fd 3 へ出力します。標準 ISDB-T/S の raw または
+B25 ストリーム専用で、ISDB-S3/B61 とキャラクタデバイスには対応しません。
+
+```text
+stdin: TUNE\t<id>\t<channel>\n
+fd 3:  READY\t<id>\n
+stdin: START\t<id>\n
+```
+
+`READY` は旧 reader、demux、decoder のバッファを破棄し、新しいチャンネルの lock と
+reader の準備が完了したことを示します。`START` を受け取るまで新しい TS は標準出力へ
+書き出しません。選局や準備に失敗した場合は fd 3 へ
+`ERROR\t<id>\t<single-line-message>` を返します。`START` 自体への応答はなく、呼び出し側は
+標準出力の最初のデータを開始完了として扱います。
 
 詳しいオプションは `recisdb --help` / `recisdb <SUBCOMMAND> --help` を参照してください。
 
